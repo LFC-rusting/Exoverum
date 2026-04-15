@@ -1,0 +1,24 @@
+[workspace]
+members = [
+    "bootloader",
+    "kernel",
+    "crates/bootinfo",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+authors = ["Projeto Exokernel"]
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+bootinfo = { path = "crates/bootinfo" }
+
+[profile.release]
+opt-level = "z" # minimiza tamanho
+lto = "fat"     # LTO completo para eliminar lixo
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+overflow-checks = false

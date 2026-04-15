@@ -1,0 +1,10 @@
+# Artefatos de build
+/target/
+
+# Diretórios internos
+/.windsurf/
+
+# Arquivos temporários de editor/SO
+**/*.swp
+**/*.swo
+.DS_Store

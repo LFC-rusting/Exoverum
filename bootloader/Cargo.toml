@@ -1,0 +1,14 @@
+[package]
+name = "bootloader"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+name = "bootloader"
+path = "src/lib.rs"
+crate-type = ["staticlib"]
+
+[dependencies]
+bootinfo = { path = "../crates/bootinfo" }

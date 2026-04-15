@@ -1,0 +1,12 @@
+[package]
+name = "bootinfo"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+name = "bootinfo"
+path = "src/lib.rs"
+
+[dependencies]
