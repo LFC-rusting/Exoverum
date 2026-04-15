@@ -1,7 +1,9 @@
 # Exoverum
 
-Exoverum é um exokernel escrito em Rust para x86_64, com foco absoluto em segurança, TCB mínima e adoção de um modelo de capabilities inspirado em seL4/EROS/KeyKOS. O objetivo é construir um sistema operacional acadêmico (TCC) que oferece LibOSs isolados sobre um núcleo extremamente enxuto, priorizando `#![forbid(unsafe_code)]` sempre que possível e documentando qualquer exceção.
+Exoverum is an exokernel written in Rust for x86_64, with an uncompromising focus on security, a minimal TCB, and a capability model inspired by seL4/EROS/KeyKOS. The goal is to build an academic operating system that offers isolated LibOSes on top of an extremely lean core, prioritizing `#![forbid(unsafe_code)]` whenever possible and documenting every exception.
 
-O repositório atual contém apenas a fundação do bootloader UEFI, o esqueleto do kernel e o crate de `BootInfo`. O pipeline ainda não foi testado de ponta a ponta: estou consolidando especificações e invariantes antes de expor fluxos de build públicos. Contribuições são bem-vindas desde que respeitem as regras essenciais: nada de dependências externas desnecessárias, mantenha o código mínimo e explique impactos na superfície de confiança.
+This repository currently contains only the UEFI bootloader foundation, the kernel skeleton, and the `BootInfo` crate. The pipeline has not yet been tested end to end; I am consolidating specifications and invariants before exposing public build flows.
 
-Licença: [The Unlicense](https://unlicense.org/).
+Contributions are welcome as long as they respect the essential rules: no unnecessary external dependencies, keep the code minimal, and explain any impact on the attack surface.
+
+License: [The Unlicense](https://unlicense.org/).
