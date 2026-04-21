@@ -9,7 +9,7 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 authors = ["Projeto Exokernel"]
-license = "MIT"
+license = "Unlicense"
 publish = false
 
 [workspace.dependencies]
@@ -21,7 +21,7 @@ lto = "fat"     # LTO completo para eliminar lixo
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
-overflow-checks = false
+overflow-checks = true
 
 [profile.dev]
 panic = "abort"
