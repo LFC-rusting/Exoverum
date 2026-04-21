@@ -8,7 +8,6 @@ publish = false
 [lib]
 name = "bootloader"
 path = "src/lib.rs"
-crate-type = ["staticlib"]
 
 [dependencies]
 bootinfo = { path = "../crates/bootinfo" }

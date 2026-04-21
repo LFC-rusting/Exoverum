@@ -1,15 +1,15 @@
+//! Utilitários de layout físico. Atualmente só verifica sobreposição de ranges.
+//! Mantido separado do montador real de page tables (em `platform::uefi`) porque
+//! é lógica pura, safe, e testável sem UEFI.
+
+#![forbid(unsafe_code)]
+
 use bootinfo::PhysRange;
 
 use crate::BootError;
 
-/// Representa um mapeamento identity mínimo necessário para handoff.
-pub struct IdentityMap {
-    pub kernel_phys: PhysRange,
-    pub stack_phys: PhysRange,
-    pub framebuffer_phys: Option<PhysRange>,
-}
-
-/// Valida se ranges não se sobrepõem (útil para sanity-check do layout).
+/// Falha se quaisquer dois ranges da lista se sobrepõem. O(n^2) sem alocação;
+/// `n` é sempre pequeno (kernel, stack, framebuffer).
 pub fn assert_non_overlapping(ranges: &[PhysRange]) -> Result<(), BootError> {
     for (i, a) in ranges.iter().enumerate() {
         for (j, b) in ranges.iter().enumerate() {
@@ -28,28 +28,34 @@ fn overlaps(a: &PhysRange, b: &PhysRange) -> bool {
     !(a.end <= b.start || b.end <= a.start)
 }
 
-/// Constrói IdentityMap validando sobreposição.
-pub fn build_identity_map(
-    kernel_phys: PhysRange,
-    stack_phys: PhysRange,
-    framebuffer_phys: Option<PhysRange>,
-) -> Result<IdentityMap, BootError> {
-    let mut buf: [Option<PhysRange>; 3] = [None, None, None];
-    buf[0] = Some(kernel_phys);
-    buf[1] = Some(stack_phys);
-    if let Some(fb) = framebuffer_phys {
-        buf[2] = Some(fb);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sem_sobreposicao() {
+        let r = [
+            PhysRange { start: 0, end: 100 },
+            PhysRange { start: 200, end: 300 },
+        ];
+        assert!(assert_non_overlapping(&r).is_ok());
     }
-    let mut collected = [kernel_phys; 3];
-    let mut count = 0usize;
-    for item in buf.iter().flatten() {
-        collected[count] = *item;
-        count += 1;
+
+    #[test]
+    fn com_sobreposicao() {
+        let r = [
+            PhysRange { start: 0, end: 150 },
+            PhysRange { start: 100, end: 200 },
+        ];
+        assert!(assert_non_overlapping(&r).is_err());
     }
-    assert_non_overlapping(&collected[..count])?;
-    Ok(IdentityMap {
-        kernel_phys,
-        stack_phys,
-        framebuffer_phys,
-    })
+
+    #[test]
+    fn adjacente_nao_sobrepoe() {
+        let r = [
+            PhysRange { start: 0, end: 100 },
+            PhysRange { start: 100, end: 200 },
+        ];
+        assert!(assert_non_overlapping(&r).is_ok());
+    }
 }
