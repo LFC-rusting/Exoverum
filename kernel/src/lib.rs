@@ -1,23 +1,16 @@
-//! Esqueleto do kernel Exoverum.
+//! Biblioteca do kernel Exoverum.
 //!
-//! Mantenho apenas o entry `kernel_start` e um panic handler mínimo. `forbid`
-//! não é usado no crate raiz porque `#[no_mangle]` é classificado como atributo
-//! unsafe a partir de edições recentes do Rust; isolo a exceção via `#[allow]`
-//! local. Assim que o kernel crescer, a ABI será movida para um módulo dedicado.
+//! Expoe modulos em camadas:
+//!   - `arch::x86_64` concentra todo o `unsafe` (portas I/O, GDT/IDT, MSR).
+//!   - `log`, `panic`, `kmain` sao logica safe.
+//!
+//! O binario (`src/main.rs`) apenas chama `kmain::start`. O panic handler
+//! vive aqui para ser compartilhado com o bin via link.
 
 #![no_std]
-#![deny(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
-use bootinfo::BootInfo;
-
-#[allow(unsafe_code)]
-#[no_mangle]
-pub extern "C" fn kernel_start(_bootinfo: &BootInfo) -> ! {
-    loop {}
-}
-
-#[cfg(not(test))]
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    loop {}
-}
+pub mod arch;
+pub mod kmain;
+pub mod log;
+mod panic;
