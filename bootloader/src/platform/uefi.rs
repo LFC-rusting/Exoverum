@@ -700,21 +700,44 @@ pub extern "efiapi" fn efi_entry(image: EfiHandle, system_table: *mut EfiSystemT
         Err(_) => bail("[boot] erro: falha ao carregar PT_LOAD em paddr\n"),
     };
 
-    const STACK_SIZE: usize = 16 * 1024;
-    let stack_buf = match allocate_pool(bs, STACK_SIZE) {
-        Ok(b) => b,
-        Err(_) => bail("[boot] erro: falha ao alocar stack\n"),
-    };
-    let stack_start = stack_buf.as_ptr() as u64;
-    let stack_end = stack_start.saturating_add(STACK_SIZE as u64);
+    // Stack inicial alocada logo apos o kernel (page-aligned). Isso garante
+    // que kernel+stack caibam em uma regiao contigua pequena (<8 MiB), o que
+    // permite o identity map minimalista de `build_identity_pagetables`.
+    // Se alocassemos via AllocatePool o endereco seria arbitrario e o span
+    // kernel..stack excederia o limite do mapa bootstrap.
+    const STACK_PAGES: usize = 4; // 16 KiB
+    let stack_start = align_up(kernel_phys.end, PAGE_SIZE);
+    let stack_end = stack_start.saturating_add((STACK_PAGES as u64) * PAGE_SIZE);
+    if allocate_pages_at(bs, stack_start, STACK_PAGES, EFI_LOADER_DATA).is_err() {
+        bail("[boot] erro: falha ao alocar stack adjacente ao kernel\n");
+    }
     let stack_phys = PhysRange { start: stack_start, end: stack_end };
 
     if crate::mapping::assert_non_overlapping(&[kernel_phys, stack_phys]).is_err() {
         bail("[boot] erro: layout kernel/stack sobreposto\n");
     }
 
-    // Preparo buffer para o memory map. Duas chamadas: a primeira obtém tamanho.
-    let mut map_key: usize = 0;
+    // Mensagem de ok no console EFI ANTES de GetMemoryMap: output_string
+    // pode internamente alocar/liberar e invalidaria o map_key.
+    if !st.con_out.is_null() {
+        let con_out = st.con_out as *mut EfiSimpleTextOutputProtocol;
+        // SAFETY: con_out vem do firmware; OutputString aceita UTF-16 NUL-terminated.
+        let _ = unsafe { ((*con_out).output_string)(con_out, BOOT_MSG_OK.as_ptr()) };
+    }
+
+    // UEFI exige que NENHUMA alocacao ocorra entre GetMemoryMap e
+    // ExitBootServices (qualquer allocate_pool/pages invalida o map_key).
+    // Por isso montamos page tables PRIMEIRO (elas precisam alocar paginas
+    // de tabela) e so depois capturamos a memory map final.
+    let page_table_root = match build_identity_pagetables(bs, kernel_phys, stack_phys) {
+        Ok(r) => r,
+        Err(_) => bail("[boot] erro: falha ao montar page tables 4K\n"),
+    };
+
+    // Aloca o buffer da memory map. Essa e a ULTIMA alocacao permitida antes
+    // de ExitBootServices. Reservamos folga (desc_size * 2) porque o ato de
+    // alocar este proprio buffer pode fazer a map crescer por 1-2 descritores.
+    let mut map_key_probe: usize = 0;
     let mut desc_size: usize = 0;
     let (map_buf, map_buf_len) = {
         let mut map_size: usize = 0;
@@ -723,7 +746,7 @@ pub extern "efiapi" fn efi_entry(image: EfiHandle, system_table: *mut EfiSystemT
             (bs.as_ref().get_memory_map)(
                 &mut map_size as *mut usize,
                 core::ptr::null_mut(),
-                &mut map_key as *mut usize,
+                &mut map_key_probe as *mut usize,
                 &mut desc_size as *mut usize,
                 core::ptr::null_mut(),
             )
@@ -731,7 +754,7 @@ pub extern "efiapi" fn efi_entry(image: EfiHandle, system_table: *mut EfiSystemT
         if !status_is_buffer_too_small(status) {
             bail("[boot] erro: GetMemoryMap nao pediu buffer\n");
         }
-        let extra = desc_size.saturating_mul(2);
+        let extra = desc_size.saturating_mul(4);
         let total = map_size.saturating_add(extra);
         match allocate_pool(bs, total) {
             Ok(b) => (b, total),
@@ -739,6 +762,8 @@ pub extern "efiapi" fn efi_entry(image: EfiHandle, system_table: *mut EfiSystemT
         }
     };
 
+    // Captura final da memory map. `map_key` aqui DEVE ser usado sem
+    // qualquer alocacao intermediaria ate ExitBootServices.
     let (mem_map, map_key, _desc_size) = match get_memory_map_real(
         bs,
         map_buf.as_ptr() as *mut EfiMemoryDescriptor,
@@ -748,18 +773,10 @@ pub extern "efiapi" fn efi_entry(image: EfiHandle, system_table: *mut EfiSystemT
         Err(_) => bail("[boot] erro: GetMemoryMap falhou\n"),
     };
 
-    let page_table_root = match build_identity_pagetables(bs, kernel_phys, stack_phys) {
-        Ok(r) => r,
-        Err(_) => bail("[boot] erro: falha ao montar page tables 4K\n"),
-    };
-
+    // A partir daqui: APENAS operacoes sem efeito em memoria/firmware.
+    // `build_bootinfo` e pura (so compoe bytes); `serial::write_str`
+    // escreve em portas I/O, nao aloca.
     let bootinfo = build_bootinfo(mem_map, None, None, None, page_table_root, kernel_phys);
-
-    if !st.con_out.is_null() {
-        let con_out = st.con_out as *mut EfiSimpleTextOutputProtocol;
-        // SAFETY: con_out vem do firmware; OutputString aceita UTF-16 NUL-terminated.
-        let _ = unsafe { ((*con_out).output_string)(con_out, BOOT_MSG_OK.as_ptr()) };
-    }
 
     serial::write_str("[boot] ExitBootServices\n");
     // SAFETY: chamada UEFI terminal; `map_key` foi obtido na última GetMemoryMap.
