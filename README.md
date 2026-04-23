@@ -4,6 +4,4 @@ Exoverum is an exokernel written in Rust for x86_64, with an uncompromising focu
 
 This repository currently contains only the UEFI bootloader foundation, the kernel skeleton, and the `BootInfo` crate. The pipeline has not yet been tested end to end; I am consolidating specifications and invariants before exposing public build flows.
 
-Contributions are welcome as long as they respect the essential rules: no external dependencies, keep the code minimal as possible, and explain any impact on the attack surface.
-
 License: [The Unlicense](https://unlicense.org/).
