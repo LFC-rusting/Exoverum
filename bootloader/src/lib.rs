@@ -21,15 +21,14 @@ pub mod platform;
 
 pub use elf::{kernel_entry_from_elf, kernel_phys_range_from_elf, validate_kernel_elf};
 
-#[cfg(not(test))]
-use core::panic::PanicInfo;
-
-/// Panic handler: tenta logar via serial antes de parar. `serial::write_str` é
-/// idempotente e silenciosa se o UART não respondeu ao probe, então nunca piora
-/// a situação. Em seguida entra em loop, já que `panic = "abort"` está ativo.
-#[cfg(not(test))]
+/// Panic handler: tenta logar via serial antes de parar. `serial::write_str`
+/// e idempotente e silenciosa se o UART nao respondeu ao probe, entao nunca
+/// piora a situacao. Em seguida entra em loop, ja que `panic = "abort"` esta
+/// ativo. Gated em `target_os = "uefi"` para nao colidir com `std::panic_impl`
+/// em builds de host-test (linux-gnu).
+#[cfg(all(target_os = "uefi", not(test)))]
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
+fn panic(_info: &core::panic::PanicInfo) -> ! {
     platform::serial::write_str("[boot] PANIC\n");
     loop {}
 }
