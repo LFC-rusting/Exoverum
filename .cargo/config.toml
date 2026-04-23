@@ -1,6 +1,32 @@
+# Alvo default do workspace: bootloader UEFI. O kernel roda em outro alvo
+# (bare-metal ELF) e é construido via o alias `build-kernel` definido abaixo.
 [build]
 target = "x86_64-unknown-uefi"
 
 [target.x86_64-unknown-uefi]
-# manter abort para evitar unwinding no ambiente UEFI
+# panic=abort evita unwinding no ambiente UEFI
 rustflags = ["-C", "panic=abort"]
+
+[target.x86_64-unknown-none]
+# Kernel bare-metal identity-mapped em low memory (2 MiB).
+# Uso o code model "small" (default) por rodar abaixo dos 2 GiB. Quando o
+# kernel migrar para higher-half futuramente, troco para "kernel".
+# no-redzone e indispensavel para handlers de interrupcao.
+# Desabilito SSE para nao precisar salvar estado FP ainda; MMX e soft-float
+# sao implicados (x86_64-unknown-none ja vem com soft-float padrao).
+rustflags = [
+    "-C", "panic=abort",
+    "-C", "relocation-model=static",
+    "-C", "no-redzone=yes",
+    "-C", "target-feature=-sse",
+]
+
+[alias]
+# Builds de conveniencia; evita passar --target manualmente.
+build-kernel = "build -p kernel --target x86_64-unknown-none"
+build-kernel-release = "build -p kernel --target x86_64-unknown-none --release"
+build-bootloader = "build -p bootloader"
+build-bootloader-release = "build -p bootloader --release"
+# Testes de host: apenas a lib do bootloader (a bin tem `#[no_main]` e so
+# linka em UEFI). Kernel segue o mesmo padrao quando ganhar testes de host.
+test-host = "test --lib -p bootloader -p bootinfo --target x86_64-unknown-linux-gnu"
