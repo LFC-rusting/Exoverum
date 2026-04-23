@@ -4,11 +4,12 @@ version = "0.0.1"
 edition = "2021"
 license = "Unlicense"
 publish = false
+build = "build.rs"
 
-[lib]
+# Binario ELF carregado pelo bootloader em endereco fixo definido em linker.ld.
+[[bin]]
 name = "kernel"
-path = "src/lib.rs"
-crate-type = ["staticlib"]
+path = "src/main.rs"
 
 [dependencies]
 bootinfo = { path = "../crates/bootinfo" }
