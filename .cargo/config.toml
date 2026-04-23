@@ -1,0 +1,6 @@
+[build]
+target = "x86_64-unknown-uefi"
+
+[target.x86_64-unknown-uefi]
+# manter abort para evitar unwinding no ambiente UEFI
+rustflags = ["-C", "panic=abort"]

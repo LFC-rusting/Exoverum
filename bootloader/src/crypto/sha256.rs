@@ -1,7 +1,7 @@
 //! Implementação própria de SHA-256 (FIPS 180-4), sem dependências, sem alocação.
 //!
 //! Motivação: a regra do projeto proíbe crates externas e exige TCB mínima; como
-//! precisamos verificar o hash do ELF do kernel antes do ExitBootServices, incluímos
+//! preciso verificar o hash do ELF do kernel antes do ExitBootServices, incluí
 //! aqui uma versão pequena, safe e auditável. Testes contra vetores conhecidos ficam
 //! no próprio módulo para permitir `cargo test` no host.
 
@@ -172,6 +172,36 @@ mod tests {
         let data = b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
         let h = sha256(data);
         let esperado = b"248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1";
+        assert_eq!(&hex(&h), esperado);
+    }
+
+    // Vetores NIST FIPS 180-4 adicionais para endurecer a confiança.
+    // Cobrem: entrada de 1 byte, entrada de 2 blocos exatos (112 B) e o
+    // caso longo canônico de 1 milhão de 'a' (multiplos blocos cheios + padding).
+
+    #[test]
+    fn vetor_um_byte() {
+        let h = sha256(b"a");
+        let esperado = b"ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb";
+        assert_eq!(&hex(&h), esperado);
+    }
+
+    #[test]
+    fn vetor_112_bytes_dois_blocos() {
+        let data = b"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
+        assert_eq!(data.len(), 112);
+        let h = sha256(data);
+        let esperado = b"cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1";
+        assert_eq!(&hex(&h), esperado);
+    }
+
+    #[test]
+    fn vetor_um_milhao_de_a() {
+        // Caso canônico NIST: 1_000_000 bytes 'a'. Exercita muitas iterações
+        // do laço de blocos cheios e detecta qualquer drift no offset/length.
+        let data = [b'a'; 1_000_000];
+        let h = sha256(&data);
+        let esperado = b"cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0";
         assert_eq!(&hex(&h), esperado);
     }
 }
