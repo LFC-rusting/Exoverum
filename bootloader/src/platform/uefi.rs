@@ -12,7 +12,7 @@ use core::slice;
 
 use crate::{
     build_bootinfo,
-    elf::{kernel_entry_from_elf, kernel_phys_range_from_elf},
+    elf::{kernel_entry_from_elf, kernel_phys_range_from_elf, parse_elf_header, parse_ph, PT_LOAD},
     platform::serial,
     process_kernel_image,
     BootError,
@@ -116,11 +116,23 @@ pub struct EfiRuntimeServices {
     pub hdr: EfiTableHeader,
 }
 
+/// `EFI_BOOT_SERVICES` em ordem estrita da UEFI 2.9 (secao 4.4). Qualquer campo
+/// nao utilizado fica como `usize` placeholder para preservar o layout binario
+/// exato. Alterar esta ordem QUEBRA todas as chamadas indiretas.
 #[repr(C)]
 pub struct EfiBootServices {
     pub hdr: EfiTableHeader,
-    pub allocate_pool: unsafe extern "efiapi" fn(pool_type: u32, size: usize, buf: *mut *mut c_void) -> Status,
-    pub free_pool: unsafe extern "efiapi" fn(buf: *mut c_void) -> Status,
+    // Task Priority Services
+    pub raise_tpl: usize,
+    pub restore_tpl: usize,
+    // Memory Services
+    pub allocate_pages: unsafe extern "efiapi" fn(
+        allocate_type: u32,
+        memory_type: u32,
+        pages: usize,
+        memory: *mut u64,
+    ) -> Status,
+    pub free_pages: usize,
     pub get_memory_map: unsafe extern "efiapi" fn(
         memory_map_size: *mut usize,
         memory_map: *mut EfiMemoryDescriptor,
@@ -128,13 +140,39 @@ pub struct EfiBootServices {
         descriptor_size: *mut usize,
         descriptor_version: *mut u32,
     ) -> Status,
-    pub allocate_pages: usize,
-    pub free_pages: usize,
+    pub allocate_pool: unsafe extern "efiapi" fn(pool_type: u32, size: usize, buf: *mut *mut c_void) -> Status,
+    pub free_pool: unsafe extern "efiapi" fn(buf: *mut c_void) -> Status,
+    // Event & Timer Services
+    pub create_event: usize,
+    pub set_timer: usize,
+    pub wait_for_event: usize,
+    pub signal_event: usize,
+    pub close_event: usize,
+    pub check_event: usize,
+    // Protocol Handler Services
+    pub install_protocol_interface: usize,
+    pub reinstall_protocol_interface: usize,
+    pub uninstall_protocol_interface: usize,
+    pub handle_protocol: usize,
+    pub reserved: usize,
+    pub register_protocol_notify: usize,
+    pub locate_handle: usize,
+    pub locate_device_path: usize,
+    pub install_configuration_table: usize,
+    // Image Services
+    pub load_image: usize,
+    pub start_image: usize,
+    pub exit: usize,
+    pub unload_image: usize,
+    pub exit_boot_services: unsafe extern "efiapi" fn(image_handle: EfiHandle, map_key: usize) -> Status,
+    // Misc Services
     pub get_next_monotonic_count: usize,
     pub stall: usize,
     pub set_watchdog_timer: usize,
+    // DriverSupport Services
     pub connect_controller: usize,
     pub disconnect_controller: usize,
+    // Open and Close Protocol Services
     pub open_protocol: unsafe extern "efiapi" fn(
         handle: EfiHandle,
         protocol: *const Guid,
@@ -145,20 +183,18 @@ pub struct EfiBootServices {
     ) -> Status,
     pub close_protocol: usize,
     pub open_protocol_information: usize,
+    // Library Services
     pub protocols_per_handle: usize,
     pub locate_handle_buffer: usize,
-    pub locate_protocol: unsafe extern "efiapi" fn(
-        protocol: *const Guid,
-        registration: *const c_void,
-        interface: *mut *mut c_void,
-    ) -> Status,
+    pub locate_protocol: usize,
     pub install_multiple_protocol_interfaces: usize,
     pub uninstall_multiple_protocol_interfaces: usize,
+    // 32-bit CRC Services
     pub calculate_crc32: usize,
+    // Misc Services
     pub copy_mem: usize,
     pub set_mem: usize,
     pub create_event_ex: usize,
-    pub exit_boot_services: unsafe extern "efiapi" fn(image_handle: EfiHandle, map_key: usize) -> Status,
 }
 
 #[repr(C)]
@@ -195,7 +231,13 @@ pub const EFI_FILE_INFO_GUID: Guid = Guid {
 };
 
 pub const EFI_FILE_MODE_READ: u64 = 0x0000_0000_0000_0001;
+pub const EFI_LOADER_CODE: u32 = 3;
 pub const EFI_LOADER_DATA: u32 = 4;
+
+// EFI_ALLOCATE_TYPE (UEFI 2.9 secao 7.2.1).
+pub const EFI_ALLOCATE_ANY_PAGES: u32 = 0;
+pub const EFI_ALLOCATE_MAX_ADDRESS: u32 = 1;
+pub const EFI_ALLOCATE_ADDRESS: u32 = 2;
 
 pub const KERNEL_PATH_UTF16: [u16; 21] = [
     0x005c, 0x0045, 0x0046, 0x0049, 0x005c, 0x0042, 0x004f, 0x004f, 0x0054, 0x005c,
@@ -416,6 +458,98 @@ fn allocate_pool(bs: NonNull<EfiBootServices>, size: usize) -> Result<NonNull<c_
     NonNull::new(buf).ok_or(BootError::MissingKernel)
 }
 
+/// Aloca `pages` paginas de 4 KiB em endereco fisico fixo `addr`. Usado para
+/// mapear cada segmento PT_LOAD do kernel em seu `p_paddr` antes de pular.
+///
+/// Retorna erro se o firmware nao puder conceder o endereco exato (p. ex.
+/// regiao reservada).
+fn allocate_pages_at(
+    bs: NonNull<EfiBootServices>,
+    addr: u64,
+    pages: usize,
+    mem_type: u32,
+) -> Result<(), BootError> {
+    let mut target = addr;
+    // SAFETY: AllocatePages(AllocateAddress) tenta alocar `pages` em
+    // `target`; em sucesso preserva o endereco. Em falha retorna status
+    // != SUCCESS e a regiao fica intocada.
+    let status = unsafe {
+        (bs.as_ref().allocate_pages)(
+            EFI_ALLOCATE_ADDRESS,
+            mem_type,
+            pages,
+            &mut target as *mut u64,
+        )
+    };
+    if !status_success(status) || target != addr {
+        return Err(BootError::MissingKernel);
+    }
+    Ok(())
+}
+
+/// Carrega o kernel ELF em memoria fisica: para cada PT_LOAD aloca paginas em
+/// `p_paddr`, copia `filesz` bytes e zera o resto (`memsz - filesz`).
+///
+/// Assume que o ELF ja foi validado por `validate_kernel_elf`. Em falha nao
+/// desfaz alocacoes parciais (firmware as reclama apos ExitBootServices se
+/// houver; aqui tratamos como erro fatal e damos `bail`).
+pub fn load_elf_segments_real(
+    bs: NonNull<EfiBootServices>,
+    elf: &[u8],
+) -> Result<u64, BootError> {
+    let hdr = parse_elf_header(elf)?;
+
+    // Aloca um unico bloco cobrindo toda a faixa fisica do kernel. Mais
+    // simples que alocar por segmento (evita overlaps de pagina entre
+    // segmentos) e garante uma unica chamada AllocatePages.
+    let range = kernel_phys_range_from_elf(elf)?;
+    let start = align_down(range.start, PAGE_SIZE);
+    let end = align_up(range.end, PAGE_SIZE);
+    let total_bytes = end
+        .checked_sub(start)
+        .ok_or(BootError::InvalidElf)?;
+    let pages = (total_bytes / PAGE_SIZE) as usize;
+
+    allocate_pages_at(bs, start, pages, EFI_LOADER_CODE)?;
+
+    // SAFETY: regiao recem-alocada; sem outros leitores/escritores.
+    // Zero antes de copiar para que `.bss` (memsz > filesz) fique zerada
+    // sem precisar de logica adicional por segmento.
+    unsafe {
+        core::ptr::write_bytes(
+            start as *mut u8,
+            0,
+            total_bytes as usize,
+        );
+    }
+
+    // Copia cada PT_LOAD para seu `p_paddr`.
+    for i in 0..hdr.phnum {
+        let ph = parse_ph(elf, hdr.phoff, hdr.phentsize, i)?;
+        if ph.p_type != PT_LOAD {
+            continue;
+        }
+        let off = ph.offset as usize;
+        let sz = ph.filesz as usize;
+        let end_off = off.checked_add(sz).ok_or(BootError::InvalidElf)?;
+        if end_off > elf.len() {
+            return Err(BootError::InvalidElf);
+        }
+        // SAFETY: `src` valido dentro de `elf`. Destino alocado acima e
+        // pertence a regiao do kernel; sem sobreposicao com `src` (pool
+        // UEFI vs. memoria recem-alocada para o kernel).
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                elf.as_ptr().add(off),
+                ph.paddr as *mut u8,
+                sz,
+            );
+        }
+    }
+
+    Ok(hdr.entry)
+}
+
 fn open_protocol<T>(
     bs: NonNull<EfiBootServices>,
     handle: EfiHandle,
@@ -555,6 +689,15 @@ pub extern "efiapi" fn efi_entry(image: EfiHandle, system_table: *mut EfiSystemT
     let kernel_phys = match kernel_phys_range_from_elf(kernel) {
         Ok(r) => r,
         Err(_) => bail("[boot] erro: faixa fisica do kernel invalida\n"),
+    };
+
+    // Copia os segmentos PT_LOAD para seus enderecos fisicos reais via
+    // AllocatePages(AllocateAddress). Necessario porque `load_kernel_real`
+    // deposita o ELF em pool arbitraria; o kernel precisa estar em `p_paddr`.
+    serial::write_str("[boot] copiando PT_LOAD para enderecos fisicos\n");
+    let _kernel_entry = match load_elf_segments_real(bs, kernel) {
+        Ok(e) => e,
+        Err(_) => bail("[boot] erro: falha ao carregar PT_LOAD em paddr\n"),
     };
 
     const STACK_SIZE: usize = 16 * 1024;
