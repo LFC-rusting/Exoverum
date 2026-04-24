@@ -40,10 +40,12 @@ const EFI_BUFFER_TOO_SMALL: Status = Status(EFI_ERROR_BIT | 5);
 const PAGE_SIZE: u64 = 4096;
 const PTE_PRESENT: u64 = 1;
 const PTE_WRITABLE: u64 = 1 << 1;
-/// Teto de cobertura da identity map: 4 page tables * 512 entradas * 4 KiB = 8 MiB.
-/// Se o kernel+stack ultrapassarem isso, `build_identity_pagetables` retorna erro
-/// em vez de escrever fora do buffer.
-const MAX_PT_PAGES: usize = 4;
+const PTE_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+
+/// VMA base do kernel higher-half: `phys + KERNEL_VMA_OFFSET = virt`.
+/// Tem que bater com `kernel/linker.ld` (KERNEL_VMA - KERNEL_LMA) e com
+/// `kernel::mm::KERNEL_VMA_OFFSET`.
+const KERNEL_VMA_OFFSET: u64 = 0xFFFF_FFFF_8000_0000;
 
 fn status_success(status: Status) -> bool {
     status.0 == Status::SUCCESS.0
@@ -575,74 +577,143 @@ fn open_protocol<T>(
     NonNull::new(iface as *mut T).ok_or(BootError::MissingKernel)
 }
 
+/// Aloca **uma pagina de 4 KiB 4K-alinhada** via AllocatePages (AnyPages).
+/// AllocatePool nao garante alinhamento de pagina; qualquer endereco com
+/// bits [11:0] != 0 seria truncado pelo walk da MMU (que so enxerga [51:12]).
 fn zero_page(bs: NonNull<EfiBootServices>) -> Result<NonNull<u64>, BootError> {
-    let page = allocate_pool(bs, PAGE_SIZE as usize)?;
-    // SAFETY: `page` aponta para área de pelo menos PAGE_SIZE bytes alocada via AllocatePool.
-    unsafe { core::ptr::write_bytes(page.as_ptr(), 0, PAGE_SIZE as usize) };
-    NonNull::new(page.as_ptr() as *mut u64).ok_or(BootError::PageTableUnavailable)
-}
-
-/// Monta page tables 4 KiB identity mapping cobrindo `kernel_phys` ∪ `stack_phys`.
-/// Retorna o endereço físico do PML4. Falha se o intervalo exceder `MAX_PT_PAGES * 2 MiB`.
-fn build_identity_pagetables(
-    bs: NonNull<EfiBootServices>,
-    kernel_phys: PhysRange,
-    stack_phys: PhysRange,
-) -> Result<u64, BootError> {
-    let map_start = if kernel_phys.start < stack_phys.start { kernel_phys.start } else { stack_phys.start };
-    let map_end = if kernel_phys.end > stack_phys.end { kernel_phys.end } else { stack_phys.end };
-    let map_start = align_down(map_start, PAGE_SIZE);
-    let map_end = align_up(map_end, PAGE_SIZE);
-
-    let max_bytes = (MAX_PT_PAGES as u64) * 512 * PAGE_SIZE;
-    if map_end.saturating_sub(map_start) > max_bytes {
+    let mut addr: u64 = 0;
+    // SAFETY: AllocatePages(AnyPages, LoaderData, 1) retorna endereco 4K-
+    // alinhado em `addr` ou status != SUCCESS.
+    let status = unsafe {
+        (bs.as_ref().allocate_pages)(EFI_ALLOCATE_ANY_PAGES, EFI_LOADER_DATA, 1, &mut addr as *mut u64)
+    };
+    if !status_success(status) || addr == 0 {
         return Err(BootError::PageTableUnavailable);
     }
+    // SAFETY: pagina recem-alocada, 4 KiB, identity-mapeada por UEFI.
+    unsafe { core::ptr::write_bytes(addr as *mut u8, 0, PAGE_SIZE as usize) };
+    NonNull::new(addr as *mut u64).ok_or(BootError::PageTableUnavailable)
+}
 
-    let pml4 = zero_page(bs)?;
-    let pdpt = zero_page(bs)?;
-    let pd = zero_page(bs)?;
-
-    let pml4_phys = pml4.as_ptr() as u64;
-    let pdpt_phys = pdpt.as_ptr() as u64;
-    let pd_phys = pd.as_ptr() as u64;
-
-    // SAFETY: páginas alocadas e zeradas; escrevo somente as primeiras entradas com flags P|W.
+/// Lê o CR3 atual. Usado para achar a PML4 UEFI, que continua ativa
+/// depois de ExitBootServices e passa a ser propriedade do bootloader.
+fn current_cr3() -> u64 {
+    let val: u64;
+    // SAFETY: `mov from CR3` em ring0 sem efeitos colaterais.
     unsafe {
-        *pml4.as_ptr() = pdpt_phys | PTE_PRESENT | PTE_WRITABLE;
-        *pdpt.as_ptr() = pd_phys | PTE_PRESENT | PTE_WRITABLE;
+        core::arch::asm!("mov {0}, cr3", out(reg) val, options(nomem, nostack, preserves_flags));
     }
+    val
+}
 
-    let mut pt_pages: [Option<NonNull<u64>>; MAX_PT_PAGES] = [None; MAX_PT_PAGES];
+const CR0_WP: u64 = 1 << 16;
 
-    let mut addr = map_start;
-    while addr < map_end {
-        let pd_index = ((addr >> 21) & 0x1ff) as usize;
-        if pd_index >= pt_pages.len() {
-            return Err(BootError::PageTableUnavailable);
-        }
-        let pt = match pt_pages[pd_index] {
-            Some(p) => p,
-            None => {
-                let p = zero_page(bs)?;
-                let pt_phys = p.as_ptr() as u64;
-                // SAFETY: PD alocado, `pd_index` < MAX_PT_PAGES < 512.
-                unsafe {
-                    *pd.as_ptr().add(pd_index) = pt_phys | PTE_PRESENT | PTE_WRITABLE;
-                }
-                pt_pages[pd_index] = Some(p);
-                p
-            }
-        };
-        let pt_index = ((addr >> 12) & 0x1ff) as usize;
-        // SAFETY: PT existe e `pt_index` < 512; mapeamento identidade (paddr = vaddr = addr).
-        unsafe {
-            *pt.as_ptr().add(pt_index) = addr | PTE_PRESENT | PTE_WRITABLE;
-        }
-        addr = addr.saturating_add(PAGE_SIZE);
+/// Desliga CR0.WP (Write-Protect) e devolve o CR0 original para restauracao.
+/// Necessario para escrever na PML4 UEFI (mapeada RO). Sem efeito em CR0.PG
+/// ou outros bits.
+fn wp_disable() -> u64 {
+    let prev: u64;
+    // SAFETY: leitura/escrita de CR0 em ring0. Apagamos so o bit WP; demais
+    // bits preservados via RMW em `prev & !CR0_WP`.
+    unsafe {
+        core::arch::asm!(
+            "mov {prev}, cr0",
+            "mov {tmp}, {prev}",
+            "and {tmp}, {mask}",
+            "mov cr0, {tmp}",
+            prev = out(reg) prev,
+            tmp = out(reg) _,
+            mask = in(reg) !CR0_WP,
+            options(nostack, preserves_flags),
+        );
     }
+    prev
+}
 
-    Ok(pml4_phys)
+/// Restaura CR0 ao valor capturado por `wp_disable`.
+fn wp_restore(prev: u64) {
+    // SAFETY: escrita do CR0 previamente lido; idempotente se chamada com
+    // o mesmo valor que `wp_disable` devolveu.
+    unsafe {
+        core::arch::asm!(
+            "mov cr0, {0}",
+            in(reg) prev,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Acrescenta à PML4 ativa um mapeamento higher-half para `kernel_phys`.
+///
+/// Não alteramos as entradas existentes (que já fornecem o identity map
+/// UEFI usado pelo próprio bootloader e pelo kernel até `mm::init_paging`).
+/// Só adicionamos entradas novas no sub-tree de PML4[511], cobrindo o kernel
+/// em 4 KiB com flags P|W. O kernel refina W^X depois, ao montar seu
+/// próprio PML4 sem identity.
+fn map_kernel_higher_half(
+    bs: NonNull<EfiBootServices>,
+    kernel_phys: PhysRange,
+) -> Result<(), BootError> {
+    let pml4_ptr = (current_cr3() & PTE_ADDR_MASK) as *mut u64;
+
+    let pstart = align_down(kernel_phys.start, PAGE_SIZE);
+    let pend = align_up(kernel_phys.end, PAGE_SIZE);
+
+    // UEFI mapeia sua propria PML4 como read-only; com CR0.WP=1 o ring0
+    // tambem respeita isso. Desligamos WP durante o augmentation e
+    // restauramos. Nao mexemos em entradas existentes: so criamos a cadeia
+    // PML4[511] -> PDPT -> PD -> PT. As sub-tabelas sao memoria que acabamos
+    // de alocar (LoaderData, R/W).
+    let wp = wp_disable();
+    let result = map_kernel_higher_half_inner(bs, pml4_ptr, pstart, pend);
+    wp_restore(wp);
+    result
+}
+
+fn map_kernel_higher_half_inner(
+    bs: NonNull<EfiBootServices>,
+    pml4_ptr: *mut u64,
+    pstart: u64,
+    pend: u64,
+) -> Result<(), BootError> {
+    let mut p = pstart;
+    while p < pend {
+        let v = p + KERNEL_VMA_OFFSET;
+        let i4 = ((v >> 39) & 0x1ff) as usize;
+        let i3 = ((v >> 30) & 0x1ff) as usize;
+        let i2 = ((v >> 21) & 0x1ff) as usize;
+        let i1 = ((v >> 12) & 0x1ff) as usize;
+
+        let pdpt = ensure_subtable(bs, pml4_ptr, i4)?;
+        let pd = ensure_subtable(bs, pdpt, i3)?;
+        let pt = ensure_subtable(bs, pd, i2)?;
+
+        // SAFETY: `pt` vem de `ensure_subtable`, que só retorna PTs alocadas
+        // por nós (zeradas) ou PTs já referenciadas pela cadeia. `i1` < 512.
+        unsafe { *pt.add(i1) = p | PTE_PRESENT | PTE_WRITABLE; }
+        p += PAGE_SIZE;
+    }
+    Ok(())
+}
+
+/// Se `parent[idx]` já aponta para uma sub-tabela, devolve-a; senão aloca
+/// uma zerada, grava a referência no pai e devolve.
+fn ensure_subtable(
+    bs: NonNull<EfiBootServices>,
+    parent: *mut u64,
+    idx: usize,
+) -> Result<*mut u64, BootError> {
+    // SAFETY: `parent` é PML4/PDPT/PD válido (veio do CR3 UEFI ou foi
+    // alocado aqui); `idx` < 512. UEFI identity-mapeia toda essa memória.
+    let entry = unsafe { *parent.add(idx) };
+    if entry & PTE_PRESENT != 0 {
+        return Ok((entry & PTE_ADDR_MASK) as *mut u64);
+    }
+    let new = zero_page(bs)?.as_ptr();
+    let new_phys = new as u64;
+    // SAFETY: mesma justificativa de leitura; escrita de uma única entrada.
+    unsafe { *parent.add(idx) = new_phys | PTE_PRESENT | PTE_WRITABLE; }
+    Ok(new)
 }
 
 /// Aborta o boot logando a causa pelo serial e entrando em loop. Usada para
@@ -701,23 +772,6 @@ pub extern "efiapi" fn efi_entry(image: EfiHandle, system_table: *mut EfiSystemT
         Err(_) => bail("[boot] erro: falha ao carregar PT_LOAD em paddr\n"),
     };
 
-    // Stack inicial alocada logo apos o kernel (page-aligned). Isso garante
-    // que kernel+stack caibam em uma regiao contigua pequena (<8 MiB), o que
-    // permite o identity map minimalista de `build_identity_pagetables`.
-    // Se alocassemos via AllocatePool o endereco seria arbitrario e o span
-    // kernel..stack excederia o limite do mapa bootstrap.
-    const STACK_PAGES: usize = 4; // 16 KiB
-    let stack_start = align_up(kernel_phys.end, PAGE_SIZE);
-    let stack_end = stack_start.saturating_add((STACK_PAGES as u64) * PAGE_SIZE);
-    if allocate_pages_at(bs, stack_start, STACK_PAGES, EFI_LOADER_DATA).is_err() {
-        bail("[boot] erro: falha ao alocar stack adjacente ao kernel\n");
-    }
-    let stack_phys = PhysRange { start: stack_start, end: stack_end };
-
-    if crate::paging::assert_non_overlapping(&[kernel_phys, stack_phys]).is_err() {
-        bail("[boot] erro: layout kernel/stack sobreposto\n");
-    }
-
     // Mensagem de ok no console EFI ANTES de GetMemoryMap: output_string
     // pode internamente alocar/liberar e invalidaria o map_key.
     if !st.con_out.is_null() {
@@ -728,12 +782,11 @@ pub extern "efiapi" fn efi_entry(image: EfiHandle, system_table: *mut EfiSystemT
 
     // UEFI exige que NENHUMA alocacao ocorra entre GetMemoryMap e
     // ExitBootServices (qualquer allocate_pool/pages invalida o map_key).
-    // Por isso montamos page tables PRIMEIRO (elas precisam alocar paginas
-    // de tabela) e so depois capturamos a memory map final.
-    let page_table_root = match build_identity_pagetables(bs, kernel_phys, stack_phys) {
-        Ok(r) => r,
-        Err(_) => bail("[boot] erro: falha ao montar page tables 4K\n"),
-    };
+    // Por isso augmentamos o PML4 UEFI PRIMEIRO (aloca PDPT/PD/PT para
+    // higher-half) e so depois capturamos a memory map final.
+    if map_kernel_higher_half(bs, kernel_phys).is_err() {
+        bail("[boot] erro: falha ao mapear kernel higher-half\n");
+    }
 
     // Aloca o buffer da memory map. Essa e a ULTIMA alocacao permitida antes
     // de ExitBootServices. Reservamos folga (desc_size * 2) porque o ato de
@@ -777,7 +830,7 @@ pub extern "efiapi" fn efi_entry(image: EfiHandle, system_table: *mut EfiSystemT
     // A partir daqui: APENAS operacoes sem efeito em memoria/firmware.
     // `build_bootinfo` e pura (so compoe bytes); `serial::write_str`
     // escreve em portas I/O, nao aloca.
-    let bootinfo = build_bootinfo(mem_map, None, None, None, page_table_root, kernel_phys);
+    let bootinfo = build_bootinfo(mem_map, None, None, None, kernel_phys);
 
     serial::write_str("[boot] ExitBootServices\n");
     // SAFETY: chamada UEFI terminal; `map_key` foi obtido na última GetMemoryMap.
