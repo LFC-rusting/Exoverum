@@ -15,7 +15,6 @@ pub struct BootInfo {
     pub framebuffer: Option<FramebufferInfo>,
     pub rsdp: Option<u64>,
     pub smbios: Option<u64>,
-    pub page_table_root: u64,
     pub kernel_phys_range: PhysRange,
 }
 
@@ -90,6 +89,6 @@ mod tests {
         assert_eq!(offset_of!(BootInfo, memory_map), 0);
         // framebuffer vem logo apos memory_map (24 bytes); Option<FramebufferInfo>
         // tem tag + payload de 24 bytes, total 32 com padding em repr(C).
-        // page_table_root e kernel_phys_range ficam apos os Options.
+        // kernel_phys_range fica apos os Options.
     }
 }
