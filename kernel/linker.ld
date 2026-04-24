@@ -24,16 +24,25 @@ SECTIONS {
     __kernel_image_start = .;
 
     .text : ALIGN(0x1000) {
+        __text_start = .;
         *(.text.boot)
         *(.text .text.*)
+        . = ALIGN(0x1000);
+        __text_end = .;
     }
 
     .rodata : ALIGN(0x1000) {
+        __rodata_start = .;
         *(.rodata .rodata.*)
+        . = ALIGN(0x1000);
+        __rodata_end = .;
     }
 
     .data : ALIGN(0x1000) {
+        __data_start = .;
         *(.data .data.*)
+        . = ALIGN(0x1000);
+        __data_end = .;
     }
 
     .bss : ALIGN(0x1000) {
@@ -47,6 +56,7 @@ SECTIONS {
         . += KERNEL_STACK_SIZE;
         __kernel_stack_top = .;
 
+        . = ALIGN(0x1000);
         __bss_end = .;
     }
 
