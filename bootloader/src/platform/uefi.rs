@@ -348,6 +348,7 @@ pub fn get_memory_map_real(
         MemoryMap {
             ptr: buffer as u64,
             len: map_size as u64,
+            desc_size: desc_size as u64,
         },
         map_key,
         desc_size,
@@ -713,7 +714,7 @@ pub extern "efiapi" fn efi_entry(image: EfiHandle, system_table: *mut EfiSystemT
     }
     let stack_phys = PhysRange { start: stack_start, end: stack_end };
 
-    if crate::mapping::assert_non_overlapping(&[kernel_phys, stack_phys]).is_err() {
+    if crate::paging::assert_non_overlapping(&[kernel_phys, stack_phys]).is_err() {
         bail("[boot] erro: layout kernel/stack sobreposto\n");
     }
 
@@ -790,8 +791,12 @@ pub extern "efiapi" fn efi_entry(image: EfiHandle, system_table: *mut EfiSystemT
         Ok(e) => e as usize,
         Err(_) => bail("[boot] erro: entry invalido\n"),
     };
-    // SAFETY: `entry` veio do ELF já validado (W^X, dentro de LOAD executável).
-    let entry_fn: extern "C" fn(*const bootinfo::BootInfo) -> ! = unsafe { mem::transmute(entry) };
+    // SAFETY: `entry` veio do ELF ja validado (W^X, dentro de LOAD executavel).
+    // ABI `sysv64` explicita: em target UEFI `extern "C"` == Windows x64 (RCX),
+    // mas o kernel compila em target bare-metal onde `extern "C"` == SysV (RDI).
+    // Se deixassemos `extern "C"`, o ponteiro chegaria no registrador errado.
+    let entry_fn: extern "sysv64" fn(*const bootinfo::BootInfo) -> ! =
+        unsafe { mem::transmute(entry) };
     entry_fn(&bootinfo as *const bootinfo::BootInfo)
 }
 

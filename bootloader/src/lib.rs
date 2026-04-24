@@ -8,15 +8,15 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-// `forbid(unsafe_code)` é aplicado em cada módulo safe individualmente
-// (elf, crypto, mapping). `platform::*` é a única porta de entrada de unsafe,
+// `forbid(unsafe_code)` e aplicado em cada modulo safe individualmente
+// (elf, crypto, paging). `platform::*` e a unica porta de entrada de unsafe,
 // por isso o crate raiz não pode declarar forbid global.
 
 use bootinfo::{BootInfo, FramebufferInfo, MemoryMap, PhysRange};
 
 pub mod elf;
 pub mod crypto;
-pub mod mapping;
+pub mod paging;
 pub mod platform;
 
 pub use elf::{kernel_entry_from_elf, kernel_phys_range_from_elf, validate_kernel_elf};
