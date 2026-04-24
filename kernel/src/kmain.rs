@@ -8,6 +8,7 @@
 use bootinfo::BootInfo;
 
 use crate::arch::x86_64::{cpu, gdt, idt};
+use crate::cap::{CapObject, CapRights, CapTable};
 use crate::log;
 use crate::mm;
 
@@ -72,8 +73,13 @@ pub unsafe fn start(bootinfo: *const BootInfo) -> ! {
     }
 
     // Fase 3a: montar PML4 com W^X e trocar CR3.
-    // SAFETY: `mm::init` completou com sucesso; `bi` continua vivo.
-    match unsafe { mm::init_paging(bi) } {
+    //
+    // IMPORTANTE: apos esta chamada, `bi` (derivado de `bootinfo` que aponta
+    // para memoria UEFI em baixo-half) torna-se inalcancavel. Nenhum acesso
+    // a `bi` ou `bootinfo` apos este ponto.
+    //
+    // SAFETY: `mm::init` completou; dados do bootinfo ja foram consumidos.
+    match unsafe { mm::init_paging() } {
         Ok(pml4) => {
             log::write_str("[kernel] paging ativo; cr3=0x");
             log_u64_hex(pml4);
@@ -92,8 +98,57 @@ pub unsafe fn start(bootinfo: *const BootInfo) -> ! {
     // Fase 3b: heap bump allocator ativo. Demo: aloca 128 B, escreve, le.
     demo_heap();
 
-    log::write_str("[kernel] fase 3 completa; halt\n");
+    // Fase 4: capabilities flat-table com CDT. Demo: mint raiz, deriva
+    // subregioes, revoga e confirma que todos os descendentes sumiram.
+    demo_caps();
+
+    log::write_str("[kernel] fase 4 completa; halt\n");
     cpu::halt_forever();
+}
+
+/// Demonstra o pipeline de capabilities: insert_root -> retype -> copy ->
+/// revoke. Serve como smoke test em boot real (complementando os 14 testes
+/// host em cap::tests).
+fn demo_caps() {
+    let mut table = CapTable::new();
+    let root = CapObject::Untyped {
+        base: 0x10_0000,
+        size: 0x10_0000,
+        free_index: 0,
+    };
+    if table.insert_root(0, root, CapRights::ALL).is_err() {
+        log::write_str("[kernel] cap err: insert_root\n");
+        return;
+    }
+    // Duas subregioes derivadas + uma copia atenuada do primeiro child.
+    // retype_untyped(src, dst, size): kernel escolhe base via watermark.
+    // Impossivel derivar dois filhos sobrepostos (bug critico de seguranca
+    // da API antiga com `new_base` livre).
+    if table.retype_untyped(0, 1, 0x4_0000).is_err()
+        || table.retype_untyped(0, 2, 0x4_0000).is_err()
+        || table.copy(1, 3, CapRights::READ).is_err()
+    {
+        log::write_str("[kernel] cap err: derivacao\n");
+        return;
+    }
+    log::write_str("[kernel] cap root + 3 descendentes criados\n");
+
+    // Revoke global: apaga TODOS os descendentes da raiz.
+    if table.revoke(0).is_err() {
+        log::write_str("[kernel] cap err: revoke\n");
+        return;
+    }
+    // Raiz sobrevive; slots 1..3 ficam vazios.
+    use crate::cap::CapError;
+    let root_ok = table.lookup(0).is_ok();
+    let descendentes_limpos = [1u16, 2, 3]
+        .iter()
+        .all(|&s| table.lookup(s) == Err(CapError::SlotEmpty));
+    if root_ok && descendentes_limpos {
+        log::write_str("[kernel] revoke global ok; raiz intacta\n");
+    } else {
+        log::write_str("[kernel] revoke global INCOERENTE\n");
+    }
 }
 
 /// Demonstra alloc de heap + write/read para validar que o range virtual
