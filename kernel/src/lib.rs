@@ -10,7 +10,17 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+// Modulos especificos de arquitetura so compilam em bare-metal. Em builds
+// de host-test (linux-gnu) eles seriam rejeitados por usarem asm inline.
+#[cfg(target_os = "none")]
 pub mod arch;
-pub mod kmain;
+#[cfg(target_os = "none")]
 pub mod log;
+#[cfg(target_os = "none")]
+pub mod kmain;
+
+// `mm` e target-agnostico (logica pura; so manipula bytes), entao
+// pode ser compilado e testado em host.
+pub mod mm;
+
 mod panic;

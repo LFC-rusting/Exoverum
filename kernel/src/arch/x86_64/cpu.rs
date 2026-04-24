@@ -68,3 +68,93 @@ pub fn halt_forever() -> ! {
         hlt();
     }
 }
+
+/// MSR EFER (Extended Feature Enable Register).
+const MSR_EFER: u32 = 0xC000_0080;
+const EFER_NXE: u64 = 1 << 11;
+
+/// Le um MSR.
+#[inline]
+fn rdmsr(msr: u32) -> u64 {
+    let lo: u32;
+    let hi: u32;
+    // SAFETY: `rdmsr` e privilegiada mas valida em ring0. Le o MSR
+    // indicado em ECX para EDX:EAX. Sem efeito em memoria/stack.
+    unsafe {
+        asm!(
+            "rdmsr",
+            in("ecx") msr,
+            out("eax") lo,
+            out("edx") hi,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    ((hi as u64) << 32) | (lo as u64)
+}
+
+/// Escreve um MSR.
+#[inline]
+fn wrmsr(msr: u32, val: u64) {
+    let lo = val as u32;
+    let hi = (val >> 32) as u32;
+    // SAFETY: `wrmsr` e privilegiada mas valida em ring0. Escreve EDX:EAX
+    // no MSR indicado em ECX. Caller responsavel por invariantes do MSR
+    // especifico (aqui, so EFER.NXE).
+    unsafe {
+        asm!(
+            "wrmsr",
+            in("ecx") msr,
+            in("eax") lo,
+            in("edx") hi,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+}
+
+/// Habilita o bit NX (No-Execute) setando `EFER.NXE`. Idempotente.
+///
+/// Necessario para que bit 63 dos PTEs seja respeitado como NX. Sem isso,
+/// a flag e reservada-must-be-zero e causaria #GP se setada.
+pub fn enable_nxe() {
+    let efer = rdmsr(MSR_EFER);
+    if efer & EFER_NXE == 0 {
+        wrmsr(MSR_EFER, efer | EFER_NXE);
+    }
+}
+
+/// Carrega `phys` no CR3, efetivando a nova tabela de paginas. A proxima
+/// instrucao ja e resolvida pelo novo mapeamento; por isso o caller deve
+/// garantir que o codigo atual (RIP) e a stack (RSP) estejam mapeados.
+///
+/// # Safety
+///
+/// `phys` deve ser o endereco fisico de um PML4 valido, 4 KiB-alinhado,
+/// que contenha mapeamentos cobrindo: o proprio kernel (text executavel),
+/// a stack atual, e qualquer dado tocado entre esta chamada e a proxima
+/// operacao segura. Violar isso causa triple-fault.
+#[inline]
+pub unsafe fn load_cr3(phys: u64) {
+    // SAFETY: delegada ao caller (documentada acima).
+    unsafe {
+        asm!(
+            "mov cr3, {0}",
+            in(reg) phys,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Le o valor atual de CR3 (endereco fisico do PML4 ativo).
+#[inline]
+pub fn read_cr3() -> u64 {
+    let val: u64;
+    // SAFETY: leitura de registro de controle; ring0, sem efeito colateral.
+    unsafe {
+        asm!(
+            "mov {0}, cr3",
+            out(reg) val,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    val
+}
