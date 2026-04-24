@@ -1,29 +1,32 @@
 /*
- * Linker script do kernel Exoverum.
+ * Linker script do kernel Exoverum (higher-half).
  *
- * Layout minimo: kernel identity-mapped em 2 MiB (0x200000), area baixa ja
- * reservada pelo bootloader via AllocatePages. Uma unica secao de carga
- * contendo text/rodata/data/bss, alinhadas a 4 KiB para facilitar paginacao
- * futura. Uma stack inicial de 64 KiB e embutida em .bss para que o kernel
- * tenha RSP valido assim que salta no entry.
+ * VMA: 0xFFFFFFFF80200000 (kernel roda no topo do espaco de enderecamento,
+ * deixando o low-half inteiro para LibOS/userland). LMA: 0x200000 (endereco
+ * fisico onde o bootloader copia os PT_LOAD). A relacao `virt = phys +
+ * KERNEL_VMA_OFFSET` com offset 0xFFFFFFFF80000000 eh fixa e replicada no
+ * kernel (mm/mod.rs) como `KERNEL_VMA_OFFSET`.
  *
- * ENTRY aponta para kernel_start (definido em src/main.rs). O bootloader
- * le o e_entry do ELF apos copiar as secoes PT_LOAD para seus p_paddr.
+ * Secoes separadas por 4 KiB para permitir W^X por secao. Stack de 64 KiB
+ * embutida em .bss: o entry stub (main.rs) troca RSP para `__kernel_stack_top`
+ * antes da primeira chamada de funcao, para sobreviver ao drop do identity
+ * mapping durante `mm::init_paging`.
  */
 
 ENTRY(kernel_start)
 OUTPUT_FORMAT(elf64-x86-64)
 OUTPUT_ARCH(i386:x86-64)
 
-KERNEL_BASE = 0x200000;
+KERNEL_LMA = 0x200000;
+KERNEL_VMA = 0xFFFFFFFF80200000;
 KERNEL_STACK_SIZE = 0x10000;
 
 SECTIONS {
-    . = KERNEL_BASE;
+    . = KERNEL_VMA;
 
     __kernel_image_start = .;
 
-    .text : ALIGN(0x1000) {
+    .text : AT(ADDR(.text) - KERNEL_VMA + KERNEL_LMA) ALIGN(0x1000) {
         __text_start = .;
         *(.text.boot)
         *(.text .text.*)
@@ -31,21 +34,21 @@ SECTIONS {
         __text_end = .;
     }
 
-    .rodata : ALIGN(0x1000) {
+    .rodata : AT(ADDR(.rodata) - KERNEL_VMA + KERNEL_LMA) ALIGN(0x1000) {
         __rodata_start = .;
         *(.rodata .rodata.*)
         . = ALIGN(0x1000);
         __rodata_end = .;
     }
 
-    .data : ALIGN(0x1000) {
+    .data : AT(ADDR(.data) - KERNEL_VMA + KERNEL_LMA) ALIGN(0x1000) {
         __data_start = .;
         *(.data .data.*)
         . = ALIGN(0x1000);
         __data_end = .;
     }
 
-    .bss : ALIGN(0x1000) {
+    .bss : AT(ADDR(.bss) - KERNEL_VMA + KERNEL_LMA) ALIGN(0x1000) {
         __bss_start = .;
         *(COMMON)
         *(.bss .bss.*)
