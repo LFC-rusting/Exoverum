@@ -9,14 +9,13 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 // `forbid(unsafe_code)` e aplicado em cada modulo safe individualmente
-// (elf, crypto, paging). `platform::*` e a unica porta de entrada de unsafe,
+// (elf, crypto). `platform::*` e a unica porta de entrada de unsafe,
 // por isso o crate raiz não pode declarar forbid global.
 
 use bootinfo::{BootInfo, FramebufferInfo, MemoryMap, PhysRange};
 
 pub mod elf;
 pub mod crypto;
-pub mod paging;
 pub mod platform;
 
 pub use elf::{kernel_entry_from_elf, kernel_phys_range_from_elf, validate_kernel_elf};
@@ -59,7 +58,6 @@ pub struct PlatformInfo {
     pub framebuffer: Option<FramebufferInfo>,
     pub rsdp: Option<u64>,
     pub smbios: Option<u64>,
-    pub page_table_root: u64,
     pub kernel_phys_range: PhysRange,
 }
 
@@ -86,7 +84,6 @@ pub fn build_bootinfo(
     framebuffer: Option<FramebufferInfo>,
     rsdp: Option<u64>,
     smbios: Option<u64>,
-    page_table_root: u64,
     kernel_phys_range: PhysRange,
 ) -> BootInfo {
     BootInfo {
@@ -94,7 +91,6 @@ pub fn build_bootinfo(
         framebuffer,
         rsdp,
         smbios,
-        page_table_root,
         kernel_phys_range,
     }
 }
