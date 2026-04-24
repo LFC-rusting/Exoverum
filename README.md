@@ -8,7 +8,7 @@ exception.
 
 ## Status
 
-- **Kernel code budget (hard cap)**: keep kernel code at **<= 6k Rust LoC**.
+- **Overall code budget (hard cap)**: keep overall Rust code at **<= 6k Rust LoC**.
 - **Current kernel size (approx.)**: ~1.3k Rust LoC.
 - **Current bootloader size (approx.)**: ~1.1k Rust LoC.
 - **Phase 1 — boot & traps**: UEFI bootloader (ELF load, identity PT, memory
