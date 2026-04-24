@@ -110,6 +110,11 @@ extern "C" {
     static __bss_end: u8;
 }
 
+/// Offset higher-half: `virt = phys + KERNEL_VMA_OFFSET`. Tem que bater
+/// com `kernel/linker.ld` (KERNEL_VMA - KERNEL_LMA) e com o bootloader
+/// (`bootloader/src/platform/uefi.rs::KERNEL_VMA_OFFSET`).
+pub const KERNEL_VMA_OFFSET: u64 = 0xFFFF_FFFF_8000_0000;
+
 /// Erro de inicializacao da paginacao.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PagingError {
@@ -119,18 +124,25 @@ pub enum PagingError {
     InternalConflict,
 }
 
-/// Constroi um novo PML4 com W^X aplicado por secao, mapeia stack e o
-/// buffer da MemoryMap, habilita NX no EFER e troca CR3.
+/// Constroi um novo PML4 higher-half puro: kernel em 0xFFFFFFFF80200000+,
+/// heap logo apos `__bss_end`, aplica W^X por secao, habilita NX no EFER e
+/// troca CR3 (drop do identity UEFI).
 ///
 /// # Safety
 ///
 /// - Deve ser chamado uma unica vez apos `mm::init`.
-/// - Kernel deve estar executando sob identity mapping UEFI que cobra
-///   `[__text_start, __bss_end)`; a troca de CR3 so e segura porque o
-///   novo PML4 reproduz a identity map dessas paginas.
-/// - `bootinfo` deve estar vivo e apontar para MemoryMap ainda valida.
+/// - Kernel roda sob PML4 do bootloader (UEFI identity + higher-half).
+///   A troca de CR3 para o novo PML4 so e segura porque ele cobre todas
+///   as paginas que o kernel continuara a tocar (text, rodata, .bss incl.
+///   stack, heap recem-mapeado) em higher-half.
+/// - **Contrato forte**: qualquer referencia `&BootInfo` do caller torna-se
+///   invalida apos esta chamada (o buffer UEFI de BootInfo/MemoryMap esta
+///   em baixo-half, que deixa de ser mapeado). Por isso NAO recebemos
+///   `&BootInfo` como parametro: o caller nao pode passar uma referencia
+///   que ele mesmo nao deve mais usar. Todos os dados necessarios ja
+///   foram copiados em `mm::init`.
 #[cfg(target_os = "none")]
-pub unsafe fn init_paging(bootinfo: &BootInfo) -> Result<u64, PagingError> {
+pub unsafe fn init_paging() -> Result<u64, PagingError> {
     use crate::arch::x86_64::cpu;
     use core::ptr::addr_of;
 
@@ -148,16 +160,11 @@ pub unsafe fn init_paging(bootinfo: &BootInfo) -> Result<u64, PagingError> {
 
     let pml4_phys = alloc_zeroed_table().ok_or(PagingError::OutOfFrames)?;
 
-    // Mapeia cada secao do kernel com seu perfil W^X.
-    identity_map_range(pml4_phys, text_start, text_end, Perm::Rx)?;
-    identity_map_range(pml4_phys, rodata_start, rodata_end, Perm::Ro)?;
-    identity_map_range(pml4_phys, data_start, bss_end, Perm::Rw)?;
-
-    // MemoryMap buffer: RO. Bootloader pode ter alocado fora do kernel_phys.
-    let mm_start = bootinfo.memory_map.ptr & !(frame::FRAME_SIZE - 1);
-    let mm_end_raw = bootinfo.memory_map.ptr + bootinfo.memory_map.len as u64;
-    let mm_end = (mm_end_raw + frame::FRAME_SIZE - 1) & !(frame::FRAME_SIZE - 1);
-    identity_map_range(pml4_phys, mm_start, mm_end, Perm::Ro)?;
+    // Mapeia cada secao do kernel com seu perfil W^X. `virt` = simbolo do
+    // linker (higher-half); `phys` = virt - KERNEL_VMA_OFFSET.
+    map_range(pml4_phys, text_start, text_end, text_start - KERNEL_VMA_OFFSET, Perm::Rx)?;
+    map_range(pml4_phys, rodata_start, rodata_end, rodata_start - KERNEL_VMA_OFFSET, Perm::Ro)?;
+    map_range(pml4_phys, data_start, bss_end, data_start - KERNEL_VMA_OFFSET, Perm::Rw)?;
 
     // Heap: 256 frames RW+NX em faixa virtual contigua logo apos `__bss_end`.
     // Cada pagina virtual recebe um frame fisico independente (nao-contiguo).
@@ -172,7 +179,8 @@ pub unsafe fn init_paging(bootinfo: &BootInfo) -> Result<u64, PagingError> {
 
     // SAFETY: pml4_phys foi construido acima. Todas as paginas que o
     // kernel continuara a executar ate `halt_forever` (text, stack em
-    // .bss, bootinfo na mm, heap) estao mapeadas.
+    // .bss, heap) estao mapeadas em higher-half. A MM buffer fica orfa,
+    // mas nao e mais lida (mm::init ja copiou tudo que precisavamos).
     unsafe { cpu::load_cr3(pml4_phys); }
 
     heap::KERNEL_HEAP.init(heap_base as usize);
@@ -197,21 +205,26 @@ fn alloc_zeroed_table() -> Option<u64> {
     Some(phys)
 }
 
-/// Mapeia um intervalo fisico `[start, end)` identity (virt=phys) com o
-/// perfil W^X indicado. Range deve estar alinhado a 4 KiB.
+/// Mapeia um intervalo virtual `[vstart, vend)` para `[phys_start, ...)`
+/// em paginas de 4 KiB com o perfil W^X indicado. Todos os enderecos
+/// devem estar alinhados a 4 KiB.
 #[cfg(target_os = "none")]
-fn identity_map_range(
+fn map_range(
     pml4_phys: u64,
-    start: u64,
-    end: u64,
+    vstart: u64,
+    vend: u64,
+    phys_start: u64,
     perm: Perm,
 ) -> Result<(), PagingError> {
-    debug_assert!(start & (frame::FRAME_SIZE - 1) == 0);
-    debug_assert!(end & (frame::FRAME_SIZE - 1) == 0);
-    let mut addr = start;
-    while addr < end {
-        map_4k(pml4_phys, addr, addr, perm)?;
-        addr += frame::FRAME_SIZE;
+    debug_assert!(vstart & (frame::FRAME_SIZE - 1) == 0);
+    debug_assert!(vend & (frame::FRAME_SIZE - 1) == 0);
+    debug_assert!(phys_start & (frame::FRAME_SIZE - 1) == 0);
+    let mut v = vstart;
+    let mut p = phys_start;
+    while v < vend {
+        map_4k(pml4_phys, v, p, perm)?;
+        v += frame::FRAME_SIZE;
+        p += frame::FRAME_SIZE;
     }
     Ok(())
 }
@@ -235,10 +248,13 @@ fn map_4k(pml4_phys: u64, virt: u64, phys: u64, perm: Perm) -> Result<(), Paging
     let pt = pt_phys as *mut u64;
     let pte_addr = unsafe { pt.add(idx.pt) };
     let existing = unsafe { pte_addr.read() };
-    if pte_present(existing) && pte_phys(existing) != (phys & paging::PTE_ADDR_MASK) {
+    // Conflito se (a) endereco fisico divergir, ou (b) flags (W/NX) divergirem.
+    // Sem (b) seria possivel escalar permissoes re-mapeando o mesmo frame.
+    let new_pte = make_pte(phys, perm);
+    if pte_present(existing) && existing != new_pte {
         return Err(PagingError::InternalConflict);
     }
-    unsafe { pte_addr.write(make_pte(phys, perm)); }
+    unsafe { pte_addr.write(new_pte); }
     Ok(())
 }
 
