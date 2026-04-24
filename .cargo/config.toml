@@ -29,4 +29,4 @@ build-bootloader = "build -p bootloader"
 build-bootloader-release = "build -p bootloader --release"
 # Testes de host: apenas a lib do bootloader (a bin tem `#[no_main]` e so
 # linka em UEFI). Kernel segue o mesmo padrao quando ganhar testes de host.
-test-host = "test --lib -p bootloader -p bootinfo --target x86_64-unknown-linux-gnu"
+test-host = "test --lib -p bootloader -p bootinfo -p kernel --target x86_64-unknown-linux-gnu"

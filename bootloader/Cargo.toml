@@ -9,5 +9,12 @@ publish = false
 name = "bootloader"
 path = "src/lib.rs"
 
+# Alvo binario explicito: gera `bootloader.efi` no target x86_64-unknown-uefi.
+# Sem declarar, o cargo autodetecta src/main.rs, o que funciona mas deixa a
+# intencao implicita. Explicitar e KISS.
+[[bin]]
+name = "bootloader"
+path = "src/main.rs"
+
 [dependencies]
 bootinfo = { path = "../crates/bootinfo" }
