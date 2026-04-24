@@ -23,4 +23,7 @@ pub mod kmain;
 // pode ser compilado e testado em host.
 pub mod mm;
 
+// `cap` e pure safe Rust (#![forbid(unsafe_code)]). Host-testavel.
+pub mod cap;
+
 mod panic;
