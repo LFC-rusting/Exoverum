@@ -95,6 +95,10 @@ pub unsafe fn start(bootinfo: *const BootInfo) -> ! {
         }
     }
 
+    // Fase 3d: prova que physmap esta ativo e que map_kernel_page consegue
+    // materializar novas paginas POS-init_paging (pre-requisito da Fase 5).
+    demo_physmap();
+
     // Fase 3b: heap bump allocator ativo. Demo: aloca 128 B, escreve, le.
     demo_heap();
 
@@ -148,6 +152,47 @@ fn demo_caps() {
         log::write_str("[kernel] revoke global ok; raiz intacta\n");
     } else {
         log::write_str("[kernel] revoke global INCOERENTE\n");
+    }
+}
+
+/// Demonstra que `mm::map_kernel_page` consegue mapear uma nova pagina
+/// POS-`init_paging` (identity ja sumiu) e que o physmap entrega a mesma
+/// memoria via virtual alternativo. Pre-requisito de correcao para a Fase 5.
+///
+/// VA escolhida: `0xFFFF_FFFF_C000_0000` (PML4=511, PDPT=511; nao colide
+/// com kernel em PDPT=510 nem com heap).
+fn demo_physmap() {
+    const DEMO_VA: u64 = 0xFFFF_FFFF_C000_0000;
+    const PATTERN: u8 = 0xA5;
+
+    let frame = match mm::alloc_frame() {
+        Some(f) => f,
+        None => {
+            log::write_str("[kernel] physmap err: sem frames\n");
+            return;
+        }
+    };
+    // SAFETY: pos-init_paging, map_kernel_page e a API correta. VA e
+    // phys alinhados a 4 KiB (frame.addr() vem de PhysFrame alinhado;
+    // DEMO_VA termina em zeros).
+    let r = unsafe { mm::map_kernel_page(DEMO_VA, frame.addr(), mm::Perm::Rw) };
+    if r.is_err() {
+        log::write_str("[kernel] physmap err: map_kernel_page\n");
+        return;
+    }
+    // SAFETY: a pagina acabou de ser mapeada RW+NX na VA DEMO_VA; escrita
+    // de um byte e valida. Leitura via physmap le o MESMO frame fisico por
+    // outro VA (provando que ambos os mapeamentos apontam para a mesma RAM).
+    unsafe {
+        let p_via_map = DEMO_VA as *mut u8;
+        p_via_map.write_volatile(PATTERN);
+        let p_via_physmap = mm::phys_to_virt(frame.addr());
+        let v = p_via_physmap.read_volatile();
+        if v == PATTERN {
+            log::write_str("[kernel] physmap ok: map+physmap view coerentes\n");
+        } else {
+            log::write_str("[kernel] physmap INCOERENTE\n");
+        }
     }
 }
 
