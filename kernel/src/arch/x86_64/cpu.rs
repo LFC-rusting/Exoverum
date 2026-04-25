@@ -144,6 +144,26 @@ pub unsafe fn load_cr3(phys: u64) {
     }
 }
 
+/// Invalida o TLB para uma unica pagina virtual.
+///
+/// # Safety
+///
+/// Caller deve garantir que `virt` e uma pagina que foi (re)mapeada; INVLPG
+/// e idempotente e nao tem efeito destrutivo, mas chamar com endereco nao-
+/// canonico causa #GP.
+#[inline]
+pub unsafe fn invlpg(virt: u64) {
+    // SAFETY: INVLPG aceita qualquer endereco canonico em ring0; so invalida
+    // a entrada TLB. Nao toca memoria nem stack.
+    unsafe {
+        asm!(
+            "invlpg [{0}]",
+            in(reg) virt,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 /// Le o valor atual de CR3 (endereco fisico do PML4 ativo).
 #[inline]
 pub fn read_cr3() -> u64 {
