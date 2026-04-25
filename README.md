@@ -9,7 +9,7 @@ exception.
 ## Status
 
 - **Overall code budget (hard cap)**: keep overall Rust code at **<= 6k Rust LoC**.
-- **Current kernel size (approx.)**: ~1.6k Rust LoC.
+- **Current kernel size (approx.)**: ~1.75k Rust LoC.
 - **Current bootloader size (approx.)**: ~1.1k Rust LoC.
 - **Phase 1 — boot & traps**: UEFI bootloader (ELF load, identity PT, memory
   map capture, ExitBootServices), kernel entry, GDT+TSS, IDT, serial logging.
@@ -27,6 +27,15 @@ exception.
   the higher-half entry. The kernel then builds its own PML4 with **no**
   identity (higher-half + heap only) and switches CR3, permanently dropping
   the low-memory aliasing.
+- **Phase 3d — physmap (direct-map)**: `PML4[256]` holds a linear direct-map
+  of physical RAM (`phys + 0xFFFF_8000_0000_0000 = virt`) using 1 GiB pages
+  (PDPTE with `PS=1`). Built *before* switching CR3 so that, once identity
+  UEFI disappears, the kernel can still read/write any physical frame —
+  required to mutate page tables allocated by the frame allocator. A single
+  atomic `PHYS_OFFSET` toggles `phys_to_virt` between "identity (pre-CR3)"
+  and "physmap (post-CR3)" transparently. Public API `map_kernel_page(virt,
+  phys, perm)` exposes this capability to later phases (TCB stacks, IPC
+  buffers). Boot-verified by `demo_physmap` (dual-view coherence check).
 - **Phase 4 — capabilities (mechanism)**: flat-table CSpace (v1) with a
   Capability Derivation Tree (CDT) for **global revoke**. Kernel objects
   are referenced by `CapSlot` indexes; per-cap rights attenuation;
@@ -112,6 +121,7 @@ On `make run` the expected serial trace is:
 [kernel] alloc frame @ 0x00000000001XXXXX   <-- always >= 1 MiB
 [kernel] frame devolvido; livres: N
 [kernel] paging ativo; cr3=0x...           <-- higher-half-only PML4
+[kernel] physmap ok: map+physmap view coerentes
 [kernel] heap alloc @ 0xFFFFFFFF802XXXXX   <-- higher-half VMA
 [kernel] heap read/write ok
 [kernel] cap root + 3 descendentes criados
