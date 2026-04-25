@@ -112,6 +112,15 @@ pub const fn make_intermediate_pte(phys: u64) -> u64 {
     (phys & PTE_ADDR_MASK) | PTE_PRESENT | PTE_WRITABLE
 }
 
+/// PTE de pagina gigante (1 GiB em PDPTE, ou 2 MiB em PDE). Marca bit PS.
+///
+/// Requisitos: `phys` deve estar alinhado ao tamanho da pagina (1 GiB para
+/// PDPTE). Em x86_64 o mesmo bit 7 e `PS` em PDPTE/PDE e `PAT` em PTE; por
+/// isso usamos `PTE_HUGE` so em entradas intermediarias, nunca em PT-folha.
+pub const fn make_huge_pte(phys: u64, perm: Perm) -> u64 {
+    (phys & PTE_ADDR_MASK) | perm.flags() | PTE_HUGE
+}
+
 /// Extrai o endereco fisico de uma entrada.
 pub const fn pte_phys(entry: u64) -> u64 {
     entry & PTE_ADDR_MASK
@@ -195,6 +204,21 @@ mod tests {
         assert_eq!(pte_phys(pte_rw), 0x300_000);
         assert_ne!(pte_rw & PTE_WRITABLE, 0);
         assert_ne!(pte_rw & PTE_NO_EXECUTE, 0);
+    }
+
+    #[test]
+    fn make_huge_seta_ps_e_respeita_perm() {
+        // PDPTE de 1 GiB em phys=0, perm=Rw (physmap caso base).
+        let pte = make_huge_pte(0, Perm::Rw);
+        assert_ne!(pte & PTE_HUGE, 0, "PS deve estar setado em huge PTE");
+        assert_ne!(pte & PTE_PRESENT, 0);
+        assert_ne!(pte & PTE_WRITABLE, 0);
+        assert_ne!(pte & PTE_NO_EXECUTE, 0, "physmap e RW+NX");
+        assert_eq!(pte_phys(pte), 0);
+
+        // 1 GiB-alinhado: 0x4000_0000.
+        let pte2 = make_huge_pte(0x4000_0000, Perm::Rw);
+        assert_eq!(pte_phys(pte2), 0x4000_0000);
     }
 
     #[test]
