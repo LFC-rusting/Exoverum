@@ -26,4 +26,9 @@ pub mod mm;
 // `cap` e pure safe Rust (#![forbid(unsafe_code)]). Host-testavel.
 pub mod cap;
 
+// `thread`: estruturas (ThreadContext, Thread, Handle) compilam em host
+// para testar invariantes de layout via `offset_of!`. As funcoes unsafe
+// (spawn, yield_to) ficam cfg-gated em target_os="none".
+pub mod thread;
+
 mod panic;
