@@ -9,6 +9,7 @@
 //! Qualquer outro modulo deve declarar `#![forbid(unsafe_code)]`. Cada bloco
 //! unsafe traz comentario `SAFETY:` explicando a invariante que o justifica.
 
+pub mod apic;
 pub mod context;
 pub mod cpu;
 pub mod gdt;
