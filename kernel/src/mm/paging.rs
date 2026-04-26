@@ -53,8 +53,12 @@ pub enum Perm {
     Rx,
     /// Read-only (NX). Usado para `.rodata` e memory map apos parse.
     Ro,
-    /// Read + Write (NX). Usado para `.data`, `.bss`, stack, heap.
+    /// Read + Write (NX). Usado para `.data`, `.bss`, stack.
     Rw,
+    /// Read + Write + NX + **uncacheable** (PCD+PWT). Exclusivo para MMIO
+    /// (LAPIC, HPET etc.) — Intel SDM 10.4.1 exige UC para registradores
+    /// memory-mapped. Caching would combine writes / return stale reads.
+    Mmio,
 }
 
 impl Perm {
@@ -63,6 +67,10 @@ impl Perm {
             Perm::Rx => PTE_PRESENT,
             Perm::Ro => PTE_PRESENT | PTE_NO_EXECUTE,
             Perm::Rw => PTE_PRESENT | PTE_WRITABLE | PTE_NO_EXECUTE,
+            Perm::Mmio => {
+                PTE_PRESENT | PTE_WRITABLE | PTE_NO_EXECUTE
+                    | PTE_CACHE_DISABLE | PTE_WRITE_THROUGH
+            }
         }
     }
 }
@@ -158,6 +166,16 @@ mod tests {
         assert_eq!(Perm::Rx.flags() & PTE_WRITABLE, 0);
         assert_ne!(Perm::Rw.flags() & PTE_NO_EXECUTE, 0);
         assert_ne!(Perm::Ro.flags() & PTE_NO_EXECUTE, 0);
+    }
+
+    #[test]
+    fn perm_mmio_eh_uncacheable_e_nx() {
+        let f = Perm::Mmio.flags();
+        assert_ne!(f & PTE_PRESENT, 0);
+        assert_ne!(f & PTE_WRITABLE, 0);
+        assert_ne!(f & PTE_NO_EXECUTE, 0, "MMIO nunca deve ser executavel");
+        assert_ne!(f & PTE_CACHE_DISABLE, 0, "PCD exigido por Intel SDM 10.4.1");
+        assert_ne!(f & PTE_WRITE_THROUGH, 0, "PWT exigido por Intel SDM 10.4.1");
     }
 
     #[test]
