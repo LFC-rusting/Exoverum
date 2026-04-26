@@ -16,7 +16,7 @@ capability model and CDT-based revoke.
 ## Status
 
 - **Overall code budget (hard cap)**: keep overall Rust code at **<= 6k Rust LoC**.
-- **Current kernel size (approx.)**: ~1.65k Rust LoC.
+- **Current kernel size (approx.)**: ~1.9k Rust LoC.
 - **Current bootloader size (approx.)**: ~1.1k Rust LoC.
 - **Phase 1 — boot & traps**: UEFI bootloader (ELF load, identity PT, memory
   map capture, ExitBootServices), kernel entry, GDT+TSS, IDT, serial logging.
@@ -58,22 +58,32 @@ capability model and CDT-based revoke.
   invalidates every derivation descending from it — no access can outlive
   its root, across processes. Host-verified (14 focused tests) and smoke-
   tested at boot in the `demo_caps` flow.
-- **Phase 5 — Thread Control Blocks & cooperative scheduling mechanism**
-  (next): `Thread` (the Thread Control Block — not to be confused with TCB
-  = Trusted Computing Base) as a capability-typed kernel object
-  (`retype_untyped` from frames). Kernel state limited to `CURRENT_THREAD`
-  (the running thread). **No run queue, no scheduling policy in the kernel.**
-  Two primitives only:
-  - `yield_to(thread_cap)` — cooperative, atomic context switch to another
-    thread the caller has a capability for. Donates the rest of the quantum.
-  - **Quantum-end upcall** — APIC one-shot timer fires; kernel saves the
-    current thread and invokes a pre-registered entry point in the LibOS
-    that owns the timer capability. The LibOS picks the next thread and
-    issues `yield_to`. Failure to respond within a fixed deadline →
-    fail-stop (security > liveness, per *rules-essenciais §1*).
+- **Phase 5a — Thread Control Blocks & cooperative `yield_to`**: `Thread`
+  (the Thread Control Block — not to be confused with TCB = Trusted
+  Computing Base) is a kernel object with statically-sized table
+  (`MAX_THREADS = 8`). Each thread owns a 16 KiB stack mapped via
+  `map_kernel_page` with a 4 KiB unmapped guard underneath (overflow
+  becomes #PF). Kernel state limited to `CURRENT` (running thread index).
+  **No run queue, no scheduling policy in the kernel.** Two primitives:
+  - `spawn(entry)` — allocates stack frames, pre-pushes `entry` as RIP,
+    returns `ThreadHandle`.
+  - `yield_to(handle)` — cooperative, atomic context switch via a
+    `#[unsafe(naked)]` `switch_context` saving non-volatile SysV regs
+    (rbx, rbp, r12-r15, rsp) and `ret`-ing into the new thread.
+
+  `CapObject::Thread { handle }` slots the thread into the capability
+  layer (full `retype_untyped → Thread` lands with user-mode in Phase 7).
+  Boot-verified by `demo_threads`: the trace `A1 → B1 → A2 → B2 → A3 → B3`
+  proves six successful context switches.
 
   Round-robin, priority, EDF, lottery, gang scheduling — *all in LibOS*.
   Different LibOSes can run incompatible policies side-by-side.
+- **Phase 5b — APIC one-shot timer + quantum-end upcall** (deferred to
+  Phase 7): until user-mode and a LibOS exist, there is no recipient for
+  the upcall. The mechanism is reserved: APIC one-shot fires, kernel saves
+  `CURRENT`, jumps to a pre-registered LibOS entry, and that LibOS issues
+  `yield_to(next)`. Failure to respond within a fixed deadline → fail-stop
+  (security > liveness, *rules-essenciais §1*).
 - **Phase 6 — Protected Control Transfer (PCT)** (pending): the kernel does
   **not** define IPC abstractions. Per Engler95, it provides only the
   minimum mechanism for protected cross-domain control transfer; LibOSes
@@ -122,6 +132,8 @@ kernel/                 Bare-metal ELF binary
   src/arch/x86_64/      cpu / gdt / idt / serial (unsafe isolated)
   src/mm/               frame, paging (+ unsafe boundary in mod.rs)
   src/cap.rs            capabilities flat-table + CDT + global revoke
+  src/thread.rs         Thread Control Blocks + spawn + yield_to (Phase 5a)
+  src/arch/x86_64/context.rs  switch_context (#[unsafe(naked)] + SysV)
   linker.ld             kernel layout (VMA 0xFFFFFFFF80200000, LMA 0x200000)
 ```
 
@@ -160,7 +172,13 @@ On `make run` the expected serial trace is:
 [kernel] physmap ok: map+physmap view coerentes
 [kernel] cap root + 3 descendentes criados
 [kernel] revoke global ok; raiz intacta
-[kernel] fase 4 completa; halt
+[kernel] threads spawned; yield_to A
+[kernel] thread A1                          <-- 6 cooperative
+[kernel] thread B1                          <-- context switches
+[kernel] thread A2
+[kernel] thread B2
+[kernel] thread A3
+[kernel] thread B3; threads done
 ```
 
 ## Security rules (binding)
