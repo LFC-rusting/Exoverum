@@ -48,7 +48,7 @@ impl CapRights {
 }
 
 /// Referencia a um objeto do kernel. Em v1 so existe `Untyped`; as proximas
-/// fases adicionam `Tcb`, `Frame`, `Endpoint`, `Notification`.
+/// fases adicionam `Thread` (Thread Control Block), `Frame`, `Event`.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum CapObject {
     /// Regiao de memoria fisica nao-tipada `[base, base + size)`.
@@ -498,7 +498,7 @@ mod tests {
     fn retype_em_nao_untyped_seria_wrong_type() {
         // Teste-esqueleto: hoje so temos Untyped, entao nao conseguimos
         // materializar WrongType sem outro tipo. Preservado como
-        // placeholder para quando introduzirmos Tcb/Frame/Endpoint.
+        // placeholder para quando introduzirmos Thread/Frame/Event.
     }
 
     #[test]
