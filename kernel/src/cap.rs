@@ -60,6 +60,11 @@ pub enum CapObject {
     /// `revoke` do proprio Untyped reseta `free_index = 0` (todos os filhos
     /// ja foram destruidos e a regiao pode ser reusada).
     Untyped { base: u64, size: u64, free_index: u64 },
+    /// Thread Control Block. `handle` e o indice na tabela `crate::thread`.
+    /// O cap so concede direito de operar sobre essa thread (ex: yield_to);
+    /// o objeto vive em `thread::THREADS` e nao na CapTable. Mecanismo:
+    /// `retype_untyped_to_thread` (Fase 7) sera quem cria pares cap+slot.
+    Thread { handle: u8 },
 }
 
 /// Slot da tabela. `Empty` e o estado livre.
@@ -439,10 +444,12 @@ mod tests {
                 assert_eq!(size, 0x1000);
                 assert_eq!(free_index, 0, "filho novo comeca com free_index zero");
             }
+            _ => unreachable!("teste so cria Untyped"),
         }
         // Watermark de `src` avancou para 0x1000.
         match t.lookup(0).unwrap().0 {
             CapObject::Untyped { free_index, .. } => assert_eq!(free_index, 0x1000),
+            _ => unreachable!("teste so cria Untyped"),
         }
     }
 
@@ -452,8 +459,14 @@ mod tests {
         t.insert_root(0, mk_untyped(0x1000, 0x4000), CapRights::ALL).unwrap();
         t.retype_untyped(0, 1, 0x1000).unwrap(); // [0x1000, 0x2000)
         t.retype_untyped(0, 2, 0x1000).unwrap(); // [0x2000, 0x3000)
-        let b1 = match t.lookup(1).unwrap().0 { CapObject::Untyped { base, .. } => base };
-        let b2 = match t.lookup(2).unwrap().0 { CapObject::Untyped { base, .. } => base };
+        let b1 = match t.lookup(1).unwrap().0 {
+            CapObject::Untyped { base, .. } => base,
+            _ => unreachable!("teste so cria Untyped"),
+        };
+        let b2 = match t.lookup(2).unwrap().0 {
+            CapObject::Untyped { base, .. } => base,
+            _ => unreachable!("teste so cria Untyped"),
+        };
         assert_ne!(b1, b2, "irmaos nunca compartilham base");
         assert_eq!(b2, b1 + 0x1000, "segundo filho vem logo apos o primeiro");
     }
@@ -491,6 +504,7 @@ mod tests {
         t.retype_untyped(0, 1, 0x1000).unwrap();
         match t.lookup(1).unwrap().0 {
             CapObject::Untyped { base, .. } => assert_eq!(base, 0x1000),
+            _ => unreachable!("teste so cria Untyped"),
         }
     }
 
@@ -548,6 +562,7 @@ mod tests {
         match t.lookup(2).unwrap().0 {
             CapObject::Untyped { base, .. } => assert_eq!(base, 0x0000),
             // ^ base do filho 1 era 0, watermark dele era 0, neto comeca em 0.
+            _ => unreachable!("teste so cria Untyped"),
         }
     }
 }
