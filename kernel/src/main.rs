@@ -6,6 +6,7 @@
 
 #![no_std]
 #![no_main]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 // Entry point so existe em builds bare-metal (target_os = "none"). Em builds
 // de host (cargo test, rust-analyzer default) o arquivo fica vazio para nao
@@ -34,17 +35,31 @@ mod entry {
     /// `__kernel_stack_top` via inline asm. Fase 3 substitui o PML4 UEFI
     /// por um novo que mapeia apenas `.text/.rodata/.data/.bss`; a stack
     /// original (UEFI) nao estaria mapeada.
+    ///
+    /// # Safety
+    ///
+    /// Funcao `unsafe` porque seu uso indevido **causa UB diretamente**
+    /// (regra `unsafe-rust §9`):
+    /// - `bootinfo` deve apontar para `BootInfo` valido em LoaderData
+    ///   sobrevivente a ExitBootServices, com `MemoryMap.ptr/len/desc_size`
+    ///   coerentes. Ponteiro nulo e tratado em `kmain::start`; outros
+    ///   valores invalidos resultam em deref de lixo.
+    /// - Invocada uma unica vez por boot. Reentrar = corrompe `static mut`
+    ///   do alocador global.
+    /// - Caller deve garantir CR3 com identity map UEFI ainda vigente
+    ///   (kernel ainda nao trocou para seu proprio PML4).
     #[no_mangle]
-    pub extern "sysv64" fn kernel_start(bootinfo: *const BootInfo) -> ! {
+    pub unsafe extern "sysv64" fn kernel_start(bootinfo: *const BootInfo) -> ! {
         // SAFETY:
-        // - `__kernel_stack_top` e definido pelo linker, 16 KiB-alinhado,
-        //   dentro de .bss (mapeado tanto pelo identity UEFI quanto pelo
-        //   PML4 do kernel).
-        // - `call` empurra um endereco de retorno para satisfazer a
-        //   invariante ABI de `RSP % 16 == 8` na entrada de `kmain::start`.
-        // - `bootinfo` fica em `rdi` (sysv64, primeiro arg) entre o asm e
-        //   a chamada; `options(noreturn)` desabilita epilogo.
-        // - Esta e a unica invocacao de `kmain::start` por boot.
+        // - `__kernel_stack_top` definido pelo linker (`linker.ld`), 16 KiB-
+        //   alinhado, em `.bss` (mapeado pelo identity UEFI e pelo PML4 do
+        //   kernel construido em `mm::init_paging`).
+        // - `call` empurra return address satisfazendo a invariante SysV
+        //   `RSP % 16 == 8` na entrada de `kmain::start`.
+        // - `bootinfo` fica em `rdi` (primeiro arg sysv64) atravessando
+        //   asm + chamada; `options(noreturn)` indica que nao retornamos.
+        // - `kmain::start` e `unsafe fn`; chamada satisfaz o contrato
+        //   propagando o `bootinfo` recebido (ja documentado acima).
         unsafe {
             core::arch::asm!(
                 // `lea` RIP-relative carrega o ENDERECO do simbolo no
