@@ -70,6 +70,72 @@ extern "C" fn exception_entry() -> ! {
     super::cpu::halt_forever();
 }
 
+/// Contador global de ticks do LAPIC timer. Incrementa em cada IRQ 0x40.
+pub static TIMER_TICKS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Reload do one-shot em cada tick (LAPIC DCR-16). Em QEMU TCG, valor
+/// empirico para ~0.1-0.2s por tick; valor nao-critico (so diagnostico).
+const TIMER_RELOAD_COUNT: u32 = 10_000_000;
+
+/// Exposto para o kmain armar o primeiro disparo com mesmo reload.
+pub const fn timer_reload() -> u32 { TIMER_RELOAD_COUNT }
+
+/// Corpo Rust do handler do timer. Invocado pelo trampolim naked
+/// `timer_handler_entry`. Preserva ABI SysV (callee preserva nao-volateis;
+/// volateis ja foram salvos pelo wrapper). SSE nao e tocado (desabilitado
+/// globalmente via rustflags `-sse,+soft-float`).
+extern "sysv64" fn timer_handler_rust() {
+    use core::sync::atomic::Ordering;
+    TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
+    crate::log::write_str("[kernel] timer tick\n");
+    // SAFETY: handler so executa apos apic::init; EOI valido dentro de ISR.
+    unsafe {
+        super::apic::eoi();
+        super::apic::arm_oneshot(TIMER_RELOAD_COUNT);
+    }
+}
+
+/// Trampolim naked do IRQ 0x40 (LAPIC timer). Salva volateis SysV, chama
+/// `timer_handler_rust`, restaura volateis, `iretq`.
+///
+/// ## Stack alignment
+///
+/// Entrada CPU empilhou 5 u64 (RIP/CS/RFLAGS/RSP/SS) = 40B => RSP mod 16 = 8.
+/// 9 pushes * 8B = 72B. 40+72 = 112 (mod 16 = 0). `call` empilha +8 => 120
+/// (mod 16 = 8), o que e exatamente o esperado pelo prologo SysV.
+///
+/// # Safety
+///
+/// Instalado via `IdtEntry::set` com type_attr=0x8E; invocado apenas pela
+/// CPU ao receber IRQ 0x40.
+#[unsafe(naked)]
+unsafe extern "sysv64" fn timer_handler_entry() {
+    core::arch::naked_asm!(
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "call {handler}",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+        "iretq",
+        handler = sym timer_handler_rust,
+    );
+}
+
 /// Inicializa IDT e carrega no core.
 pub fn init() {
     // Cast via *const () para satisfazer lint `function_casts_as_integer`
@@ -92,6 +158,12 @@ pub fn init() {
         // Double fault (#DF) usa IST1 para garantir stack valida mesmo se
         // a stack do kernel estiver corrompida (recomendacao Intel SDM).
         (*idt.add(8)).set(handler, KERNEL_CS, 1, INTERRUPT_GATE);
+
+        // LAPIC timer no vector 0x40 (super::apic::TIMER_VECTOR). Trampolim
+        // naked salva volateis SysV, chama Rust, iretq.
+        let timer = timer_handler_entry as *const () as usize as u64;
+        (*idt.add(super::apic::TIMER_VECTOR as usize))
+            .set(timer, KERNEL_CS, 0, INTERRUPT_GATE);
     }
 
     let base = core::ptr::addr_of!(IDT) as u64;
