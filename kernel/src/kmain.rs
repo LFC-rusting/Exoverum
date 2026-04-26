@@ -7,10 +7,13 @@
 
 use bootinfo::BootInfo;
 
+use core::sync::atomic::{AtomicU8, Ordering};
+
 use crate::arch::x86_64::{cpu, gdt, idt};
 use crate::cap::{CapObject, CapRights, CapTable};
 use crate::log;
 use crate::mm;
+use crate::thread::{self, ThreadHandle};
 
 /// Entry point chamado pelo binario (`src/main.rs`).
 ///
@@ -103,7 +106,68 @@ pub unsafe fn start(bootinfo: *const BootInfo) -> ! {
     // subregioes, revoga e confirma que todos os descendentes sumiram.
     demo_caps();
 
-    log::write_str("[kernel] fase 4 completa; halt\n");
+    // Fase 5a: cooperative threading. Spawn duas threads que alternam
+    // CPU via `yield_to`. Funcao divergente: B halts no final.
+    demo_threads();
+}
+
+// Handles compartilhados entre as duas threads do demo. Inicialmente
+// `u8::MAX` (sentinela invalido); preenchidos por `demo_threads` apos
+// `spawn`. Entry-points leem aqui para descobrir o peer.
+static THREAD_A: AtomicU8 = AtomicU8::new(u8::MAX);
+static THREAD_B: AtomicU8 = AtomicU8::new(u8::MAX);
+
+extern "sysv64" fn thread_a_entry() -> ! {
+    log::write_str("[kernel] thread A1\n");
+    // SAFETY: THREAD_B foi setado por demo_threads antes de yield_to(A).
+    let b = unsafe { ThreadHandle::from_raw(THREAD_B.load(Ordering::Relaxed)) };
+    unsafe { let _ = thread::yield_to(b); }
+    log::write_str("[kernel] thread A2\n");
+    unsafe { let _ = thread::yield_to(b); }
+    log::write_str("[kernel] thread A3\n");
+    unsafe { let _ = thread::yield_to(b); }
+    // B vai halt; nao voltamos aqui. Defensivo:
+    cpu::halt_forever();
+}
+
+extern "sysv64" fn thread_b_entry() -> ! {
+    log::write_str("[kernel] thread B1\n");
+    // SAFETY: idem.
+    let a = unsafe { ThreadHandle::from_raw(THREAD_A.load(Ordering::Relaxed)) };
+    unsafe { let _ = thread::yield_to(a); }
+    log::write_str("[kernel] thread B2\n");
+    unsafe { let _ = thread::yield_to(a); }
+    log::write_str("[kernel] thread B3; threads done\n");
+    cpu::halt_forever();
+}
+
+/// Spawn duas threads que alternam CPU. A imprime A1, B imprime B1, A imprime
+/// A2, ... ate B3, halt. Prova `switch_context` + `spawn` + `yield_to` no boot.
+fn demo_threads() -> ! {
+    // SAFETY: pos-init_paging; spawn precisa do physmap ativo, ja temos.
+    let a = match unsafe { thread::spawn(thread_a_entry) } {
+        Ok(h) => h,
+        Err(_) => {
+            log::write_str("[kernel] spawn A falhou\n");
+            cpu::halt_forever();
+        }
+    };
+    let b = match unsafe { thread::spawn(thread_b_entry) } {
+        Ok(h) => h,
+        Err(_) => {
+            log::write_str("[kernel] spawn B falhou\n");
+            cpu::halt_forever();
+        }
+    };
+    THREAD_A.store(a.raw(), Ordering::Relaxed);
+    THREAD_B.store(b.raw(), Ordering::Relaxed);
+    log::write_str("[kernel] threads spawned; yield_to A\n");
+    // SAFETY: a foi devolvido por spawn acima; thread esta Ready.
+    unsafe {
+        let _ = thread::yield_to(a);
+    }
+    // B halts ao final, entao nao voltamos aqui. Mas no caso degenerado,
+    // halt explicito (este fn e divergente).
     cpu::halt_forever();
 }
 
