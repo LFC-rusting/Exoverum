@@ -848,8 +848,16 @@ pub extern "efiapi" fn efi_entry(image: EfiHandle, system_table: *mut EfiSystemT
     // ABI `sysv64` explicita: em target UEFI `extern "C"` == Windows x64 (RCX),
     // mas o kernel compila em target bare-metal onde `extern "C"` == SysV (RDI).
     // Se deixassemos `extern "C"`, o ponteiro chegaria no registrador errado.
-    let entry_fn: extern "sysv64" fn(*const bootinfo::BootInfo) -> ! =
+    // Tipo `unsafe extern "sysv64" fn` reflete o contrato em
+    // `kernel::kernel_start` (ponteiro deve ser BootInfo valido; chamada
+    // unica por boot).
+    let entry_fn: unsafe extern "sysv64" fn(*const bootinfo::BootInfo) -> ! =
         unsafe { mem::transmute(entry) };
-    entry_fn(&bootinfo as *const bootinfo::BootInfo)
+    // SAFETY: contrato de `kernel_start` satisfeito:
+    //  - `bootinfo` aponta para struct local valida nesta stack ate iretq
+    //    (kernel copia o que precisa em `mm::init` antes de trocar PML4).
+    //  - Primeira e unica invocacao do entry por boot.
+    //  - Identity map UEFI ainda ativo (ExitBootServices nao mexe em CR3).
+    unsafe { entry_fn(&bootinfo as *const bootinfo::BootInfo) }
 }
 
