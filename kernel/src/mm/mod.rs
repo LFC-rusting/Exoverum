@@ -230,12 +230,16 @@ fn map_physmap(pml4_phys: u64) -> Result<(), PagingError> {
         let phys = i * GIB;
         let idx = Indices::from_virt(virt);
         let pdpt_phys = ensure_next_level(pml4_phys, idx.pml4)?;
-        // Escreve direto uma PDPTE huge (nao desce para PD/PT).
-        // SAFETY: pdpt_phys e um frame que alocamos; `phys_to_virt` devolve
-        // ponteiro acessivel sob o mapa vigente.
-        let pdpt = phys_to_virt(pdpt_phys) as *mut u64;
         let pte = make_huge_pte(phys, Perm::Rw);
-        unsafe { pdpt.add(idx.pdpt).write(pte); }
+        // SAFETY: `pdpt_phys` foi devolvido por `ensure_next_level` (frame
+        // alocado por nos ou ja referenciado pelo PML4). `phys_to_virt`
+        // devolve ponteiro valido sob o mapa vigente (identity UEFI ou
+        // physmap). `idx.pdpt < 512` por construcao de `Indices::from_virt`.
+        // Escrita unica de uma PDPTE de 8 bytes alinhada.
+        unsafe {
+            let pdpt = phys_to_virt(pdpt_phys) as *mut u64;
+            pdpt.add(idx.pdpt).write(pte);
+        }
     }
     Ok(())
 }
@@ -292,19 +296,25 @@ fn map_4k(pml4_phys: u64, virt: u64, phys: u64, perm: Perm) -> Result<(), Paging
     let pd_phys = ensure_next_level(pdpt_phys, idx.pdpt)?;
     let pt_phys = ensure_next_level(pd_phys, idx.pd)?;
 
-    // Escreve PTE folha com o perfil W^X final.
-    // SAFETY: pt_phys foi obtido via ensure_next_level (alocado por nos ou
-    // ja presente). `phys_to_virt` da ponteiro valido sob o mapa vigente.
-    let pt = phys_to_virt(pt_phys) as *mut u64;
-    let pte_addr = unsafe { pt.add(idx.pt) };
-    let existing = unsafe { pte_addr.read() };
-    // Conflito se (a) endereco fisico divergir, ou (b) flags (W/NX) divergirem.
-    // Sem (b) seria possivel escalar permissoes re-mapeando o mesmo frame.
     let new_pte = make_pte(phys, perm);
-    if pte_present(existing) && existing != new_pte {
-        return Err(PagingError::InternalConflict);
+    // SAFETY: `pt_phys` foi obtido via `ensure_next_level` (frame alocado
+    // por nos com `alloc_zeroed_table` ou referenciado pela cadeia ja
+    // presente). `phys_to_virt(pt_phys)` e ponteiro valido sob o mapa
+    // vigente (identity UEFI antes de `init_paging`, physmap depois).
+    // `idx.pt < 512` por construcao de `Indices::from_virt`. Read+write
+    // de uma palavra de 8 bytes alinhada (PTE). O early-return em caso
+    // de conflito nao deixa estado parcial: nada foi modificado ainda.
+    unsafe {
+        let pte_addr = (phys_to_virt(pt_phys) as *mut u64).add(idx.pt);
+        let existing = pte_addr.read();
+        // Conflito se (a) endereco fisico divergir, ou (b) flags (W/NX)
+        // divergirem. Sem (b) seria possivel escalar permissoes re-mapeando
+        // o mesmo frame.
+        if pte_present(existing) && existing != new_pte {
+            return Err(PagingError::InternalConflict);
+        }
+        pte_addr.write(new_pte);
     }
-    unsafe { pte_addr.write(new_pte); }
     Ok(())
 }
 
@@ -313,16 +323,28 @@ fn map_4k(pml4_phys: u64, virt: u64, phys: u64, perm: Perm) -> Result<(), Paging
 #[cfg(target_os = "none")]
 fn ensure_next_level(parent_phys: u64, idx: usize) -> Result<u64, PagingError> {
     use paging::{make_intermediate_pte, pte_phys, pte_present};
-    // SAFETY: parent_phys ja foi alocado por nos (ou e o PML4 inicial).
-    // `phys_to_virt` da ponteiro valido sob o mapa vigente.
-    let parent = phys_to_virt(parent_phys) as *mut u64;
-    let entry_ptr = unsafe { parent.add(idx) };
-    let entry = unsafe { entry_ptr.read() };
+    debug_assert!(idx < 512);
+    // SAFETY: `parent_phys` foi alocado por nos (PML4 inicial ou frame
+    // criado pela propria recursao). `phys_to_virt` da ponteiro valido
+    // sob o mapa vigente. `idx < 512` (assert acima). Leitura de 8 bytes
+    // alinhada e segura mesmo quando a entrada esta zerada (frames vem
+    // zerados por `alloc_zeroed_table`).
+    let entry = unsafe {
+        let parent = phys_to_virt(parent_phys) as *mut u64;
+        parent.add(idx).read()
+    };
     if pte_present(entry) {
         return Ok(pte_phys(entry));
     }
     let new_phys = alloc_zeroed_table().ok_or(PagingError::OutOfFrames)?;
-    unsafe { entry_ptr.write(make_intermediate_pte(new_phys)); }
+    let new_pte = make_intermediate_pte(new_phys);
+    // SAFETY: mesma justificativa da leitura acima; escrita unica de uma
+    // entrada intermediaria recem-criada (sem aliasing concorrente — kernel
+    // single-core sequencial nesta fase).
+    unsafe {
+        let parent = phys_to_virt(parent_phys) as *mut u64;
+        parent.add(idx).write(new_pte);
+    }
     Ok(new_phys)
 }
 
