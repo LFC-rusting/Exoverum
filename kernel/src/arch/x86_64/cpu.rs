@@ -75,7 +75,7 @@ const EFER_NXE: u64 = 1 << 11;
 
 /// Le um MSR.
 #[inline]
-fn rdmsr(msr: u32) -> u64 {
+pub(super) fn rdmsr(msr: u32) -> u64 {
     let lo: u32;
     let hi: u32;
     // SAFETY: `rdmsr` e privilegiada mas valida em ring0. Le o MSR
@@ -94,7 +94,7 @@ fn rdmsr(msr: u32) -> u64 {
 
 /// Escreve um MSR.
 #[inline]
-fn wrmsr(msr: u32, val: u64) {
+pub(super) fn wrmsr(msr: u32, val: u64) {
     let lo = val as u32;
     let hi = (val >> 32) as u32;
     // SAFETY: `wrmsr` e privilegiada mas valida em ring0. Escreve EDX:EAX
