@@ -9,7 +9,7 @@ LibOSes. The goal is an academic OS offering isolated LibOSes on top of an
 extremely lean core, prioritizing `#![forbid(unsafe_code)]` whenever possible
 and documenting every exception.
 
-**Reference sources**: Engler95 (MIT Aegis / ExOS) for exokernel philosophy
+**Reference sources**: Engler-1995 (MIT Aegis / ExOS) for exokernel philosophy
 and the *protection vs. management* split; seL4 / EROS / KeyKOS for the
 capability model and CDT-based revoke.
 
@@ -20,7 +20,7 @@ is roughly 3.3k LoC (kernel ~2.1k, bootloader ~1.1k, shared ABI crate ~80).
 
 Phases below are the roadmap from boot to a usable LibOS. Each phase only
 delivers *mechanism*: schedulers, IPC protocols, filesystems and any other
-abstraction live in user-space LibOSes (Engler95 §3 — *protection vs.
+abstraction live in user-space LibOSes (Engler-1995 §3 — *protection vs.
 management*).
 
 - **Phase 1 — boot & traps** (done). UEFI bootloader loads and validates the
@@ -35,7 +35,7 @@ management*).
   tables with **W^X enforced per section**, drops the firmware identity
   map, and exposes a direct-map view of physical RAM so any frame can be
   inspected or mutated later in the boot. **No kernel heap** by design
-  (Engler95 §3.1: exokernels export primitive resources; LibOSes build
+  (Engler-1995 §3.1: exokernels export primitive resources; LibOSes build
   dynamic memory). Kernel internals use only statically-sized state and
   capability-mediated retype over frames.
 
@@ -74,7 +74,7 @@ management*).
   fail-stop (security > liveness).
 
 - **Phase 6 — Protected Control Transfer** (pending). The kernel does
-  not define IPC abstractions. Per Engler95 it provides only the
+  not define IPC abstractions. Per Engler-1995 it provides only the
   minimum mechanism for protected cross-domain control transfer;
   LibOSes build RPC, message passing, shared memory, sockets and
   condvars on top. Three primitives are reserved:
