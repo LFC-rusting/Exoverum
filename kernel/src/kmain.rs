@@ -99,9 +99,6 @@ pub unsafe fn start(bootinfo: *const BootInfo) -> ! {
     // materializar novas paginas POS-init_paging (pre-requisito da Fase 5).
     demo_physmap();
 
-    // Fase 3b: heap bump allocator ativo. Demo: aloca 128 B, escreve, le.
-    demo_heap();
-
     // Fase 4: capabilities flat-table com CDT. Demo: mint raiz, deriva
     // subregioes, revoga e confirma que todos os descendentes sumiram.
     demo_caps();
@@ -192,42 +189,6 @@ fn demo_physmap() {
             log::write_str("[kernel] physmap ok: map+physmap view coerentes\n");
         } else {
             log::write_str("[kernel] physmap INCOERENTE\n");
-        }
-    }
-}
-
-/// Demonstra alloc de heap + write/read para validar que o range virtual
-/// esta mapeado RW no novo PML4.
-fn demo_heap() {
-    match mm::KERNEL_HEAP.alloc_bytes(128, 16) {
-        Ok(addr) => {
-            log::write_str("[kernel] heap alloc @ 0x");
-            log_u64_hex(addr as u64);
-            log::write_str("; livres=");
-            log_usize(mm::KERNEL_HEAP.free_bytes());
-            log::write_str("\n");
-            // SAFETY: heap alloc retorna endereco em [heap_base, heap_base+1MiB)
-            // mapeado RW+NX no PML4 ativo; escrita de 1 byte dentro do bloco
-            // solicitado (128 B) e valida.
-            unsafe {
-                let p = addr as *mut u8;
-                p.write_volatile(0x42);
-                let v = p.read_volatile();
-                if v == 0x42 {
-                    log::write_str("[kernel] heap read/write ok\n");
-                } else {
-                    log::write_str("[kernel] heap read/write INCOERENTE\n");
-                }
-            }
-        }
-        Err(mm::HeapError::NotInitialized) => {
-            log::write_str("[kernel] heap err: nao inicializado\n");
-        }
-        Err(mm::HeapError::OutOfMemory) => {
-            log::write_str("[kernel] heap err: OOM\n");
-        }
-        Err(mm::HeapError::BadAlignment) => {
-            log::write_str("[kernel] heap err: alinhamento invalido\n");
         }
     }
 }
