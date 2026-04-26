@@ -19,11 +19,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use bootinfo::BootInfo;
 
 pub mod frame;
-pub mod heap;
 pub mod paging;
 
 pub use frame::{FrameAllocator, FrameError, PhysFrame};
-pub use heap::{HeapError, KERNEL_HEAP};
 pub use paging::Perm;
 
 /// Wrapper `Sync` em torno do alocador para permitir `static`. Ver comentario
@@ -151,9 +149,9 @@ pub enum PagingError {
     InternalConflict,
 }
 
-/// Constroi um novo PML4 higher-half puro: kernel em 0xFFFFFFFF80200000+,
-/// heap logo apos `__bss_end`, aplica W^X por secao, habilita NX no EFER e
-/// troca CR3 (drop do identity UEFI).
+/// Constroi um novo PML4 higher-half puro: physmap em PML4[256], kernel
+/// em 0xFFFFFFFF80200000+ com W^X por secao, habilita NX no EFER e troca
+/// CR3 (drop do identity UEFI). Sem heap no kernel por design.
 ///
 /// # Safety
 ///
@@ -161,7 +159,7 @@ pub enum PagingError {
 /// - Kernel roda sob PML4 do bootloader (UEFI identity + higher-half).
 ///   A troca de CR3 para o novo PML4 so e segura porque ele cobre todas
 ///   as paginas que o kernel continuara a tocar (text, rodata, .bss incl.
-///   stack, heap recem-mapeado) em higher-half.
+///   stack) em higher-half.
 /// - **Contrato forte**: qualquer referencia `&BootInfo` do caller torna-se
 ///   invalida apos esta chamada (o buffer UEFI de BootInfo/MemoryMap esta
 ///   em baixo-half, que deixa de ser mapeado). Por isso NAO recebemos
@@ -198,29 +196,20 @@ pub unsafe fn init_paging() -> Result<u64, PagingError> {
     map_range(pml4_phys, rodata_start, rodata_end, rodata_start - KERNEL_VMA_OFFSET, Perm::Ro)?;
     map_range(pml4_phys, data_start, bss_end, data_start - KERNEL_VMA_OFFSET, Perm::Rw)?;
 
-    // 3. Heap: 256 frames RW+NX em faixa virtual contigua logo apos `__bss_end`.
-    //    Cada pagina virtual recebe um frame fisico independente (nao-contiguo).
-    //    heap::KERNEL_HEAP e inicializado com a base virtual apos mapear tudo.
-    let heap_base = bss_end;
-    let heap_pages = (heap::HEAP_SIZE as u64) / frame::FRAME_SIZE;
-    for i in 0..heap_pages {
-        let virt = heap_base + i * frame::FRAME_SIZE;
-        let f = alloc_frame().ok_or(PagingError::OutOfFrames)?;
-        map_4k(pml4_phys, virt, f.addr(), Perm::Rw)?;
-    }
-
     // SAFETY: pml4_phys foi construido acima. Todas as paginas que o
     // kernel continuara a executar ate `halt_forever` (text, stack em
-    // .bss, heap) estao mapeadas em higher-half. A MM buffer fica orfa,
+    // .bss) estao mapeadas em higher-half. A MM buffer fica orfa,
     // mas nao e mais lida (mm::init ja copiou tudo que precisavamos).
+    //
+    // Intencional: NAO mapeamos heap kernel. Exokernel puro (Engler95
+    // §3.1) nao prove abstracoes de memoria dinamica no kernel; LibOS
+    // recebe frames via capability e constroi seus proprios alocadores.
     unsafe { cpu::load_cr3(pml4_phys); }
 
     // Ativa physmap: dai em diante, `phys_to_virt(p) = p + PHYSMAP_BASE`.
     // Identity UEFI some mas permanecemos capazes de ler/escrever qualquer
     // frame fisico via higher-half.
     PHYS_OFFSET.store(PHYSMAP_BASE, Ordering::Relaxed);
-
-    heap::KERNEL_HEAP.init(heap_base as usize);
 
     Ok(pml4_phys)
 }
@@ -338,7 +327,8 @@ fn ensure_next_level(parent_phys: u64, idx: usize) -> Result<u64, PagingError> {
 }
 
 /// Le o CR3 atual e mapeia uma pagina de 4 KiB no PML4 ativo. API publica
-/// consumida pela Fase 5+ para alocar stacks de TCB, buffers de IPC, etc.
+/// consumida pela Fase 5+ para alocar stacks de thread (Thread Control
+/// Block), buffers de PCT, etc.
 ///
 /// # Safety
 ///
