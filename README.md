@@ -15,100 +15,94 @@ capability model and CDT-based revoke.
 
 ## Status
 
-- **Overall code budget (hard cap)**: keep overall Rust code at **<= 6k Rust LoC**.
-- **Current kernel size (approx.)**: ~1.9k Rust LoC.
-- **Current bootloader size (approx.)**: ~1.1k Rust LoC.
-- **Phase 1 — boot & traps**: UEFI bootloader (ELF load, identity PT, memory
-  map capture, ExitBootServices), kernel entry, GDT+TSS, IDT, serial logging.
-- **Phase 2 — physical memory**: bitmap frame allocator parsing the UEFI
-  memory map, with unconditional reservation of the first 1 MiB.
-- **Phase 3a — paging**: kernel builds its own 4 KiB PML4, enforces W^X
-  per section (`.text` RX, `.rodata` RO, `.data/.bss` RW+NX), enables NX via
-  EFER, switches CR3. Kernel stack relocated to `.bss` via `lea` inline asm
-  before any function call to survive the CR3 swap.
-- **Phase 3b — higher-half**: kernel linked at `0xFFFF_FFFF_8020_0000`; the
-  bootloader augments the active UEFI PML4 with a higher-half mapping (PML4[511]
-  chain, 4 KiB pages, CR0.WP toggled for the in-place update) then jumps to
-  the higher-half entry. The kernel then builds its own PML4 with **no**
-  identity (higher-half-only) and switches CR3, permanently dropping
-  the low-memory aliasing.
-- **Phase 3c — physmap (direct-map)**: `PML4[256]` holds a linear direct-map
-  of physical RAM (`phys + 0xFFFF_8000_0000_0000 = virt`) using 1 GiB pages
-  (PDPTE with `PS=1`). Built *before* switching CR3 so that, once identity
-  UEFI disappears, the kernel can still read/write any physical frame —
-  required to mutate page tables allocated by the frame allocator. A single
-  atomic `PHYS_OFFSET` toggles `phys_to_virt` between "identity (pre-CR3)"
-  and "physmap (post-CR3)" transparently. Public API `map_kernel_page(virt,
-  phys, perm)` exposes this capability to later phases (thread stacks, mapped
-  frames). Boot-verified by `demo_physmap` (dual-view coherence check).
+Hard code budget: total Rust source stays at **≤ 5k LoC**. Current footprint
+is roughly 3.3k LoC (kernel ~2.1k, bootloader ~1.1k, shared ABI crate ~80).
 
-  > **No kernel heap** (intentional). Engler95 §3.1 — exokernels export
-  > *primitive* hardware resources (frames, TLB entries, CPU time) and let
-  > LibOSes build dynamic memory on top. Kernel internals use only static
-  > allocations (sized in `.bss`) and `Untyped → retype` over frames.
-- **Phase 4 — capabilities (mechanism)**: flat-table CSpace (v1) with a
-  Capability Derivation Tree (CDT) for **global revoke**. Kernel objects
-  are referenced by `CapSlot` indexes; per-cap rights attenuation;
-  `insert_root`/`copy`/`delete`/`revoke`/`retype_untyped`/`lookup`. Only
-  `Untyped` object today; `Thread`, `Frame`, `Event` slot
-  in as new `CapObject` variants in later phases without ABI change. The
-  flat-table representation can later be swapped for a seL4-style graph
-  (CNodes pointing to CNodes) while keeping every public operation intact.
-  **Revoke is recursive over the CDT**: revoking any capability atomically
-  invalidates every derivation descending from it — no access can outlive
-  its root, across processes. Host-verified (14 focused tests) and smoke-
-  tested at boot in the `demo_caps` flow.
-- **Phase 5a — Thread Control Blocks & cooperative `yield_to`**: `Thread`
-  (the Thread Control Block — not to be confused with TCB = Trusted
-  Computing Base) is a kernel object with statically-sized table
-  (`MAX_THREADS = 8`). Each thread owns a 16 KiB stack mapped via
-  `map_kernel_page` with a 4 KiB unmapped guard underneath (overflow
-  becomes #PF). Kernel state limited to `CURRENT` (running thread index).
-  **No run queue, no scheduling policy in the kernel.** Two primitives:
-  - `spawn(entry)` — allocates stack frames, pre-pushes `entry` as RIP,
-    returns `ThreadHandle`.
-  - `yield_to(handle)` — cooperative, atomic context switch via a
-    `#[unsafe(naked)]` `switch_context` saving non-volatile SysV regs
-    (rbx, rbp, r12-r15, rsp) and `ret`-ing into the new thread.
+Phases below are the roadmap from boot to a usable LibOS. Each phase only
+delivers *mechanism*: schedulers, IPC protocols, filesystems and any other
+abstraction live in user-space LibOSes (Engler95 §3 — *protection vs.
+management*).
 
-  `CapObject::Thread { handle }` slots the thread into the capability
-  layer (full `retype_untyped → Thread` lands with user-mode in Phase 7).
-  Boot-verified by `demo_threads`: the trace `A1 → B1 → A2 → B2 → A3 → B3`
-  proves six successful context switches.
+- **Phase 1 — boot & traps** (done). UEFI bootloader loads and validates the
+  kernel image, captures the firmware memory map, leaves boot services and
+  jumps to the kernel entry. The kernel installs its own descriptor and
+  interrupt tables and brings serial logging up.
 
-  Round-robin, priority, EDF, lottery, gang scheduling — *all in LibOS*.
+- **Phase 2 — physical memory** (done). Bitmap frame allocator built from
+  the firmware memory map, with the first 1 MiB unconditionally reserved.
+
+- **Phase 3 — paging** (done). The kernel builds its own higher-half page
+  tables with **W^X enforced per section**, drops the firmware identity
+  map, and exposes a direct-map view of physical RAM so any frame can be
+  inspected or mutated later in the boot. **No kernel heap** by design
+  (Engler95 §3.1: exokernels export primitive resources; LibOSes build
+  dynamic memory). Kernel internals use only statically-sized state and
+  capability-mediated retype over frames.
+
+- **Phase 4 — capabilities** (done). A **flat capability table** with a
+  Capability Derivation Tree for **global revoke**: revoking any
+  capability atomically invalidates every derivation descending from it,
+  across every process. Per-cap rights attenuation, retype from
+  `Untyped`, copy and delete are all in place.
+
+  > The flat table is a deliberate v1. It can evolve to a CSpace graph
+  > (CNodes pointing to CNodes, seL4-style) later **without changing any
+  > public operation**, but that evolution is optional and may never
+  > happen — we'll switch only if a concrete need arises.
+
+- **Phase 5a — Thread Control Blocks & cooperative yield** (done). The
+  Thread Control Block (the *kernel object*, not to be confused with TCB
+  = Trusted Computing Base) is a statically-sized kernel object with a
+  guarded per-thread stack: a stack overflow becomes a fault, never silent
+  corruption. A single primitive — cooperative `yield_to` — performs the
+  context switch.
+
+  **No run queue, no scheduling policy in the kernel.** Round-robin,
+  priority, EDF, lottery, gang scheduling, all of it lives in the LibOS.
   Different LibOSes can run incompatible policies side-by-side.
-- **Phase 5b — APIC one-shot timer + quantum-end upcall** (deferred to
-  Phase 7): until user-mode and a LibOS exist, there is no recipient for
-  the upcall. The mechanism is reserved: APIC one-shot fires, kernel saves
-  `CURRENT`, jumps to a pre-registered LibOS entry, and that LibOS issues
-  `yield_to(next)`. Failure to respond within a fixed deadline → fail-stop
-  (security > liveness, *rules-essenciais §1*).
-- **Phase 6 — Protected Control Transfer (PCT)** (pending): the kernel does
-  **not** define IPC abstractions. Per Engler95, it provides only the
-  minimum mechanism for protected cross-domain control transfer; LibOSes
-  build RPC, message passing, shared memory, sockets, condvars, etc.
 
-  Three primitives:
-  1. **`pct_invoke(entry_cap, donate_quantum)`** — atomic switch of
-     protection domain (CR3, CSpace), jump to a previously registered
-     entry point in the destination domain on a pre-allocated stack.
-     Optionally donates the remaining quantum, enabling sub-microsecond
-     cross-domain calls without going through the scheduler.
-  2. **`event_signal(event_cap)` / `event_wait(event_cap)`** — single-bit
-     idempotent asynchronous signal. **No payload, no queue, no priority.**
-     LibOSes layer notifications, semaphores, condvars on top.
-  3. **`cap_grant(dest_cspace, src, dst, rights)` / `cap_move(...)`** —
-     mediated capability transfer between domains, preserving CDT and
-     rights attenuation; `revoke` already cuts the whole sub-tree.
+- **Phase 5b — periodic timer & IRQ stub** (done; full preemption
+  deferred). The local APIC is up and a one-shot timer is wired to a
+  dedicated interrupt vector. The current handler is a stub: it logs and
+  rearms.
 
-  The kernel guarantees only: capability validation, domain isolation,
-  correct context switch. Message formats, buffering, synchronization
-  models, RPC protocols — none of these exist in the kernel.
-- **Phase 7 — isolation & LibOS runtime** (pending): user-mode isolation,
-  syscall/capability boundary, and initial LibOS execution model.
-- **Phase 8 — hardening & verification** (pending): security hardening,
-  adversarial testing, and cross-VM/bare-metal validation.
+  The full *upcall* path — handing the remaining quantum to a
+  LibOS-registered entry point — lands together with user-mode in
+  Phase 7, reusing the same machinery as syscalls (separate stack,
+  saving the full register state, the privilege-boundary dance). When
+  that arrives, failing to respond within a fixed deadline triggers
+  fail-stop (security > liveness).
+
+- **Phase 6 — Protected Control Transfer** (pending). The kernel does
+  not define IPC abstractions. Per Engler95 it provides only the
+  minimum mechanism for protected cross-domain control transfer;
+  LibOSes build RPC, message passing, shared memory, sockets and
+  condvars on top. Three primitives are reserved:
+
+  - **Protected control transfer**: atomic switch of protection domain
+    (address space + capability space), jumping to a previously
+    registered entry on a pre-allocated stack. Optionally donates the
+    remaining quantum, enabling sub-microsecond cross-domain calls
+    without going through the scheduler.
+  - **Single-bit idempotent events**: signal/wait with **no payload,
+    no queue, no priority**. LibOSes layer notifications, semaphores
+    and condvars on top.
+  - **Mediated capability transfer between domains**, preserving the
+    derivation tree and rights attenuation; the existing global revoke
+    already cuts the whole sub-tree.
+
+  The kernel guarantees only capability validation, domain isolation
+  and correct context switch. Message formats, buffering, synchronization
+  models and RPC protocols are out of scope by design.
+
+- **Phase 7 — user-mode & first LibOS** (pending). Ring-3 isolation, a
+  syscall surface over the existing capability primitives, the pieces
+  deferred from Phases 5b/6 (preemption with full context switch, the
+  protected control transfer primitives), and a first LibOS executing
+  on top.
+
+- **Phase 8 — hardening & verification** (pending). Security hardening,
+  adversarial testing, cross-VM and bare-metal validation.
 
 ## Layout
 
@@ -134,6 +128,7 @@ kernel/                 Bare-metal ELF binary
   src/cap.rs            capabilities flat-table + CDT + global revoke
   src/thread.rs         Thread Control Blocks + spawn + yield_to (Phase 5a)
   src/arch/x86_64/context.rs  switch_context (#[unsafe(naked)] + SysV)
+  src/arch/x86_64/apic.rs     LAPIC init + timer one-shot + EOI (Phase 5b)
   linker.ld             kernel layout (VMA 0xFFFFFFFF80200000, LMA 0x200000)
 ```
 
@@ -172,6 +167,11 @@ On `make run` the expected serial trace is:
 [kernel] physmap ok: map+physmap view coerentes
 [kernel] cap root + 3 descendentes criados
 [kernel] revoke global ok; raiz intacta
+[kernel] apic ok; armando timer
+[kernel] timer tick                         <-- LAPIC IRQ 0x40
+[kernel] timer tick
+[kernel] timer tick
+[kernel] timer demo done; 3 ticks observados
 [kernel] threads spawned; yield_to A
 [kernel] thread A1                          <-- 6 cooperative
 [kernel] thread B1                          <-- context switches
