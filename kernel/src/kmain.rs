@@ -9,7 +9,7 @@ use bootinfo::BootInfo;
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
-use crate::arch::x86_64::{cpu, gdt, idt};
+use crate::arch::x86_64::{apic, cpu, gdt, idt};
 use crate::cap::{CapObject, CapRights, CapTable};
 use crate::log;
 use crate::mm;
@@ -106,9 +106,36 @@ pub unsafe fn start(bootinfo: *const BootInfo) -> ! {
     // subregioes, revoga e confirma que todos os descendentes sumiram.
     demo_caps();
 
+    // Fase 5b: LAPIC timer one-shot + IRQ 0x40 -> handler stub. Prova
+    // mecanismo: ticks chegam, handler loga, EOI funciona, rearm OK.
+    // Sem preempcao com troca de contexto (essa entra na Fase 7 junto
+    // com TSS IST + swapgs / syscalls).
+    demo_timer();
+
     // Fase 5a: cooperative threading. Spawn duas threads que alternam
     // CPU via `yield_to`. Funcao divergente: B halts no final.
     demo_threads();
+}
+
+/// Inicializa LAPIC, habilita IRQ 0x40, espera 3 ticks e desliga
+/// interrupcoes antes de retornar (proximas fases ainda assumem IF=0).
+fn demo_timer() {
+    // SAFETY: pos-init_paging; idt ja contem timer_handler_entry; chamada
+    // unica por boot.
+    if let Err(_) = unsafe { apic::init() } {
+        log::write_str("[kernel] apic init falhou\n");
+        return;
+    }
+    log::write_str("[kernel] apic ok; armando timer\n");
+    // SAFETY: apic::init bem-sucedido garante MMIO mapeado.
+    unsafe { apic::arm_oneshot(idt::timer_reload()); }
+    cpu::sti();
+    // Espera busy-wait por 3 ticks (handler incrementa TIMER_TICKS).
+    while idt::TIMER_TICKS.load(Ordering::Relaxed) < 3 {
+        cpu::hlt();
+    }
+    cpu::cli();
+    log::write_str("[kernel] timer demo done; 3 ticks observados\n");
 }
 
 // Handles compartilhados entre as duas threads do demo. Inicialmente
@@ -118,25 +145,38 @@ static THREAD_A: AtomicU8 = AtomicU8::new(u8::MAX);
 static THREAD_B: AtomicU8 = AtomicU8::new(u8::MAX);
 
 extern "sysv64" fn thread_a_entry() -> ! {
-    log::write_str("[kernel] thread A1\n");
-    // SAFETY: THREAD_B foi setado por demo_threads antes de yield_to(A).
-    let b = unsafe { ThreadHandle::from_raw(THREAD_B.load(Ordering::Relaxed)) };
-    unsafe { let _ = thread::yield_to(b); }
-    log::write_str("[kernel] thread A2\n");
-    unsafe { let _ = thread::yield_to(b); }
-    log::write_str("[kernel] thread A3\n");
-    unsafe { let _ = thread::yield_to(b); }
+    // SAFETY: este corpo executa APOS demo_threads ter (a) preenchido
+    // `THREAD_B` com o handle devolvido por `spawn` e (b) feito o primeiro
+    // `yield_to(A)`. Logo:
+    //  - `from_raw(THREAD_B)` reconstroi um handle que ainda existe (B nao
+    //    foi destruido; nao temos destroy nesta fase).
+    //  - `yield_to(b)` cumpre seus requisitos (post-init_paging, single-
+    //    core, handle valido).
+    // Cada chamada retorna quando B re-cede; entre elas o estado global
+    // permanece consistente (CURRENT atualizado dentro de yield_to).
+    unsafe {
+        let b = ThreadHandle::from_raw(THREAD_B.load(Ordering::Relaxed));
+        log::write_str("[kernel] thread A1\n");
+        let _ = thread::yield_to(b);
+        log::write_str("[kernel] thread A2\n");
+        let _ = thread::yield_to(b);
+        log::write_str("[kernel] thread A3\n");
+        let _ = thread::yield_to(b);
+    }
     // B vai halt; nao voltamos aqui. Defensivo:
     cpu::halt_forever();
 }
 
 extern "sysv64" fn thread_b_entry() -> ! {
-    log::write_str("[kernel] thread B1\n");
-    // SAFETY: idem.
-    let a = unsafe { ThreadHandle::from_raw(THREAD_A.load(Ordering::Relaxed)) };
-    unsafe { let _ = thread::yield_to(a); }
-    log::write_str("[kernel] thread B2\n");
-    unsafe { let _ = thread::yield_to(a); }
+    // SAFETY: simetrica a `thread_a_entry`. Quando este corpo executa,
+    // demo_threads ja preencheu `THREAD_A` e A acabou de ceder para B.
+    unsafe {
+        let a = ThreadHandle::from_raw(THREAD_A.load(Ordering::Relaxed));
+        log::write_str("[kernel] thread B1\n");
+        let _ = thread::yield_to(a);
+        log::write_str("[kernel] thread B2\n");
+        let _ = thread::yield_to(a);
+    }
     log::write_str("[kernel] thread B3; threads done\n");
     cpu::halt_forever();
 }
