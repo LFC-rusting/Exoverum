@@ -123,6 +123,15 @@ pub const KERNEL_VMA_OFFSET: u64 = 0xFFFF_FFFF_8000_0000;
 /// naturalmente se ampliarmos.
 pub const PHYSMAP_BASE: u64 = 0xFFFF_8000_0000_0000;
 
+/// Quantidade de GiB cobertos pelo physmap. Aumentar **conscientemente**:
+/// cada GiB e uma PDPTE com PS=1, mas tambem amplia a regiao acessivel via
+/// `phys_to_virt` (e portanto a regiao validada por `assert!`).
+pub const PHYSMAP_GIB: u64 = 1;
+
+/// Tamanho total do physmap em bytes. Limite superior estrito para enderecos
+/// fisicos passados a `phys_to_virt`.
+pub const PHYSMAP_BYTES: u64 = PHYSMAP_GIB * (1 << 30);
+
 /// Offset dinamico para `phys_to_virt`. Comeca em 0 (identity UEFI ativo),
 /// vira `PHYSMAP_BASE` depois que `init_paging` carrega o novo CR3.
 static PHYS_OFFSET: AtomicU64 = AtomicU64::new(0);
@@ -136,7 +145,20 @@ static PHYS_OFFSET: AtomicU64 = AtomicU64::new(0);
 ///   dentro do physmap em PML4[256].
 ///
 /// Transparente para todos os callers de page-table (map_4k, zero_table etc.)
+///
+/// # Panics
+///
+/// `phys >= PHYSMAP_BYTES`. Acessar memoria acima do physmap pos-init_paging
+/// produz page-fault em endereco unmapped; antes disso, identity UEFI
+/// tampouco cobre regioes alem do espaco efetivamente reportado pela
+/// firmware. Em ambos os casos, deref do ponteiro retornado seria
+/// catastrofico (corrupcao silenciosa ou triple-fault). `assert!` vale
+/// em release (regra unsafe-rust §5).
 pub fn phys_to_virt(phys: u64) -> *mut u8 {
+    assert!(
+        phys < PHYSMAP_BYTES,
+        "phys_to_virt: endereco fisico fora do physmap"
+    );
     (phys + PHYS_OFFSET.load(Ordering::Relaxed)) as *mut u8
 }
 
@@ -221,9 +243,6 @@ pub unsafe fn init_paging() -> Result<u64, PagingError> {
 fn map_physmap(pml4_phys: u64) -> Result<(), PagingError> {
     use paging::{make_huge_pte, Indices};
     const GIB: u64 = 1 << 30;
-    // 1 GiB e suficiente para MAX_MANAGED_FRAMES (512 MiB) com folga.
-    // Aumentar se expandirmos o suporte a RAM.
-    const PHYSMAP_GIB: u64 = 1;
 
     for i in 0..PHYSMAP_GIB {
         let virt = PHYSMAP_BASE + i * GIB;
@@ -271,9 +290,12 @@ fn map_range(
     phys_start: u64,
     perm: Perm,
 ) -> Result<(), PagingError> {
-    debug_assert!(vstart & (frame::FRAME_SIZE - 1) == 0);
-    debug_assert!(vend & (frame::FRAME_SIZE - 1) == 0);
-    debug_assert!(phys_start & (frame::FRAME_SIZE - 1) == 0);
+    // assert! (nao debug_assert!): violacao escreveria PTE com bits de
+    // offset corrompendo flags W/NX, abrindo escalada de privilegio
+    // silenciosa. Custo em release: 3 comparacoes no boot, desprezivel.
+    assert!(vstart & (frame::FRAME_SIZE - 1) == 0, "map_range: vstart desalinhado");
+    assert!(vend & (frame::FRAME_SIZE - 1) == 0, "map_range: vend desalinhado");
+    assert!(phys_start & (frame::FRAME_SIZE - 1) == 0, "map_range: phys_start desalinhado");
     let mut v = vstart;
     let mut p = phys_start;
     while v < vend {
@@ -323,7 +345,9 @@ fn map_4k(pml4_phys: u64, virt: u64, phys: u64, perm: Perm) -> Result<(), Paging
 #[cfg(target_os = "none")]
 fn ensure_next_level(parent_phys: u64, idx: usize) -> Result<u64, PagingError> {
     use paging::{make_intermediate_pte, pte_phys, pte_present};
-    debug_assert!(idx < 512);
+    // assert!: idx >= 512 escreveria fora da tabela de 4 KiB, corrompendo
+    // a tabela seguinte na RAM. Catastrofico.
+    assert!(idx < 512, "ensure_next_level: idx fora da tabela");
     // SAFETY: `parent_phys` foi alocado por nos (PML4 inicial ou frame
     // criado pela propria recursao). `phys_to_virt` da ponteiro valido
     // sob o mapa vigente. `idx < 512` (assert acima). Leitura de 8 bytes
@@ -363,8 +387,9 @@ fn ensure_next_level(parent_phys: u64, idx: usize) -> Result<u64, PagingError> {
 #[cfg(target_os = "none")]
 pub unsafe fn map_kernel_page(virt: u64, phys: u64, perm: Perm) -> Result<(), PagingError> {
     use crate::arch::x86_64::cpu;
-    debug_assert_eq!(virt & (frame::FRAME_SIZE - 1), 0);
-    debug_assert_eq!(phys & (frame::FRAME_SIZE - 1), 0);
+    // assert!: ver justificativa em `map_range`. Mesma classe de bug.
+    assert_eq!(virt & (frame::FRAME_SIZE - 1), 0, "map_kernel_page: virt desalinhado");
+    assert_eq!(phys & (frame::FRAME_SIZE - 1), 0, "map_kernel_page: phys desalinhado");
     let pml4_phys = cpu::read_cr3() & paging::PTE_ADDR_MASK;
     map_4k(pml4_phys, virt, phys, perm)?;
     // TLB invalidate da pagina recem-mapeada: escritas anteriores em PTEs
