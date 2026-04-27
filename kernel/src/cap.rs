@@ -47,10 +47,10 @@ impl CapRights {
     }
 }
 
-/// Referencia a um objeto do kernel. Em v1 so existe `Untyped`; as proximas
-/// fases adicionam `Frame`. `Thread` e `Event` ja estao previstos como
-/// variantes porque os objetos vivem em tabelas dedicadas (`thread::THREADS`,
-/// `event::EVENTS`) e a cap so carrega o handle.
+/// Referencia a um objeto do kernel. `Thread` e `Event` carregam handles
+/// porque os objetos vivem em tabelas dedicadas (`thread::THREADS`,
+/// `event::EVENTS`); apenas as caps governam o acesso. `Frame` e
+/// auto-contida (so o phys importa).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum CapObject {
     /// Regiao de memoria fisica nao-tipada `[base, base + size)`.
@@ -62,16 +62,23 @@ pub enum CapObject {
     /// `revoke` do proprio Untyped reseta `free_index = 0` (todos os filhos
     /// ja foram destruidos e a regiao pode ser reusada).
     Untyped { base: u64, size: u64, free_index: u64 },
+    /// Frame fisico de 4 KiB em `phys`. Concedida a um dominio, da o direito
+    /// de mapea-lo no proprio espaco de enderecamento via `domain::map`
+    /// (Phase 7a.6). Os bits de proteção saem de `CapRights`: WRITE permite
+    /// `Perm::UserRw`, sua ausencia restringe a `Perm::UserRx`/`UserRo`.
+    Frame { phys: u64 },
     /// Thread Control Block. `handle` e o indice na tabela `crate::thread`.
-    /// O cap so concede direito de operar sobre essa thread (ex: yield_to);
-    /// o objeto vive em `thread::THREADS` e nao na CapTable. Mecanismo:
-    /// `retype_untyped_to_thread` (Fase 7) sera quem cria pares cap+slot.
+    /// SCAFFOLDING (a sair com Phase 7b): cap concede `yield_to`/state-set.
     Thread { handle: u8 },
-    /// Evento single-bit idempotente. `handle` e o indice na tabela
-    /// `crate::event`. Cap concede direito de `signal`/`wait`; o objeto
-    /// em si (bit de estado + waiter) vive em `event::EVENTS`. Fase 7
-    /// adicionara `retype_untyped_to_event` criando par cap+slot.
+    /// Evento single-bit idempotente. `handle` em `event::EVENTS`.
+    /// SCAFFOLDING (a sair com Phase 7b).
     Event { handle: u8 },
+    /// Dominio ring 3 (Phase 7a.4). `handle` e indice na tabela
+    /// `crate::domain::DOMAINS`. Cap concede direito de mapear paginas
+    /// (`domain::map`) e, futuramente (Phase 7a.7+), receber capability
+    /// transfer (cap_grant). O objeto (CR3, CSpace propria) vive na
+    /// tabela de dominios; aqui so referenciamos por handle.
+    Domain { handle: u8 },
 }
 
 /// Slot da tabela. `Empty` e o estado livre.
