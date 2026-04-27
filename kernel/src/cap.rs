@@ -48,7 +48,9 @@ impl CapRights {
 }
 
 /// Referencia a um objeto do kernel. Em v1 so existe `Untyped`; as proximas
-/// fases adicionam `Thread` (Thread Control Block), `Frame`, `Event`.
+/// fases adicionam `Frame`. `Thread` e `Event` ja estao previstos como
+/// variantes porque os objetos vivem em tabelas dedicadas (`thread::THREADS`,
+/// `event::EVENTS`) e a cap so carrega o handle.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum CapObject {
     /// Regiao de memoria fisica nao-tipada `[base, base + size)`.
@@ -65,6 +67,11 @@ pub enum CapObject {
     /// o objeto vive em `thread::THREADS` e nao na CapTable. Mecanismo:
     /// `retype_untyped_to_thread` (Fase 7) sera quem cria pares cap+slot.
     Thread { handle: u8 },
+    /// Evento single-bit idempotente. `handle` e o indice na tabela
+    /// `crate::event`. Cap concede direito de `signal`/`wait`; o objeto
+    /// em si (bit de estado + waiter) vive em `event::EVENTS`. Fase 7
+    /// adicionara `retype_untyped_to_event` criando par cap+slot.
+    Event { handle: u8 },
 }
 
 /// Slot da tabela. `Empty` e o estado livre.
