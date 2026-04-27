@@ -15,10 +15,12 @@
 //! Atenuacao: `copy(src, dst, rights)` exige `rights ⊆ src.rights`, ou seja,
 //! derivacoes so podem diminuir direitos, nunca aumentar.
 //!
-//! Evolucao futura: quando houver multiplos CSpaces (multi-processo), esta
-//! tabela vira um `CNode` e a CDT passa a usar identificadores globais de no.
-//! A API publica (`insert_root`/`copy`/`delete`/`revoke`/`retype_untyped`/
-//! `lookup`) permanece identica; so a representacao interna muda.
+//! Cross-CSpace (Phase 8): a CDT *dentro* de uma CSpace continua local.
+//! Revogacao cross-CSpace e feita por uma tabela paralela de grants em
+//! `crate::domain::GRANTS` (`cap_grant` registra; `revoke_granted`
+//! varre e remove o destino). A CDT permanece `O(children)` por slot
+//! sem atravessar fronteiras de dominio — KISS, e suficiente para o
+//! protocolo de repossession.
 
 #![forbid(unsafe_code)]
 
@@ -47,10 +49,12 @@ impl CapRights {
     }
 }
 
-/// Referencia a um objeto do kernel. `Thread` e `Event` carregam handles
-/// porque os objetos vivem em tabelas dedicadas (`thread::THREADS`,
-/// `event::EVENTS`); apenas as caps governam o acesso. `Frame` e
-/// auto-contida (so o phys importa).
+/// Referencia a um objeto do kernel.
+///
+/// `Untyped` e `Frame` carregam o phys diretamente (self-contained).
+/// `Domain` carrega um `handle` u8 indexando `crate::domain::DOMAINS`
+/// (objeto grande: CR3 + CSpace), isolando o lifecycle do objeto da
+/// capability que o nomeia.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum CapObject {
     /// Regiao de memoria fisica nao-tipada `[base, base + size)`.
@@ -65,19 +69,10 @@ pub enum CapObject {
     /// Frame fisico de 4 KiB em `phys`. Concedida a um dominio, da o direito
     /// de mapea-lo no proprio espaco de enderecamento via `domain::map`
     /// (Phase 7a.6). Os bits de proteção saem de `CapRights`: WRITE permite
-    /// `Perm::UserRw`, sua ausencia restringe a `Perm::UserRx`/`UserRo`.
+    /// `Perm::UserRw`, sua ausencia restringe a `Perm::UserRx`.
     Frame { phys: u64 },
-    /// Thread Control Block. `handle` e o indice na tabela `crate::thread`.
-    /// SCAFFOLDING (a sair com Phase 7b): cap concede `yield_to`/state-set.
-    Thread { handle: u8 },
-    /// Evento single-bit idempotente. `handle` em `event::EVENTS`.
-    /// SCAFFOLDING (a sair com Phase 7b).
-    Event { handle: u8 },
-    /// Dominio ring 3 (Phase 7a.4). `handle` e indice na tabela
-    /// `crate::domain::DOMAINS`. Cap concede direito de mapear paginas
-    /// (`domain::map`) e, futuramente (Phase 7a.7+), receber capability
-    /// transfer (cap_grant). O objeto (CR3, CSpace propria) vive na
-    /// tabela de dominios; aqui so referenciamos por handle.
+    /// Dominio ring 3 (Phase 7a.4). `handle` e indice em `domain::DOMAINS`.
+    /// Cap concede direito de invocar o dominio via PCT (`domain_call`).
     Domain { handle: u8 },
 }
 
@@ -523,10 +518,14 @@ mod tests {
     }
 
     #[test]
-    fn retype_em_nao_untyped_seria_wrong_type() {
-        // Teste-esqueleto: hoje so temos Untyped, entao nao conseguimos
-        // materializar WrongType sem outro tipo. Preservado como
-        // placeholder para quando introduzirmos Thread/Frame/Event.
+    fn retype_em_nao_untyped_rejeitado() {
+        let mut t = CapTable::new();
+        t.insert_root(0, CapObject::Frame { phys: 0x1000 }, CapRights::ALL).unwrap();
+        assert_eq!(
+            t.retype_untyped(0, 1, 0x1000),
+            Err(CapError::WrongType),
+            "retype so funciona em Untyped"
+        );
     }
 
     #[test]
@@ -563,6 +562,116 @@ mod tests {
         assert_eq!(
             t.copy(2, 3, CapRights::WRITE),
             Err(CapError::InsufficientRights)
+        );
+    }
+
+    // ---- Phase 8: testes adversariais ----
+
+    #[test]
+    fn copy_de_slot_vazio_falha() {
+        let mut t = CapTable::new();
+        assert_eq!(
+            t.copy(0, 1, CapRights::READ),
+            Err(CapError::SlotEmpty)
+        );
+    }
+
+    #[test]
+    fn copy_src_igual_dst_rejeitado() {
+        let mut t = CapTable::new();
+        t.insert_root(0, mk_untyped(0, 4096), CapRights::ALL).unwrap();
+        // Aliasing src=dst e malicioso (cria loop na CDT). A API
+        // rejeita com SlotOccupied (semantica conservadora).
+        assert_eq!(
+            t.copy(0, 0, CapRights::READ),
+            Err(CapError::SlotOccupied)
+        );
+    }
+
+    #[test]
+    fn revoke_em_slot_vazio_falha() {
+        let mut t = CapTable::new();
+        assert_eq!(t.revoke(0), Err(CapError::SlotEmpty));
+    }
+
+    #[test]
+    fn revoke_dupla_e_idempotente_apos_primeira() {
+        let mut t = CapTable::new();
+        t.insert_root(0, mk_untyped(0, 4096), CapRights::ALL).unwrap();
+        t.copy(0, 1, CapRights::READ).unwrap();
+        t.revoke(0).unwrap();
+        // Apos primeiro revoke, raiz nao tem mais filhos. Segundo
+        // revoke e no-op (loop sai imediatamente).
+        assert!(t.revoke(0).is_ok());
+        assert!(t.lookup(0).is_ok());
+    }
+
+    #[test]
+    fn delete_fora_de_range() {
+        let mut t = CapTable::new();
+        assert_eq!(
+            t.delete(CAP_SLOTS as CapSlot),
+            Err(CapError::SlotOutOfRange)
+        );
+    }
+
+    #[test]
+    fn insert_frame_e_lookup() {
+        let mut t = CapTable::new();
+        t.insert_root(0, CapObject::Frame { phys: 0xdead_b000 }, CapRights::READ)
+            .unwrap();
+        let (obj, r) = t.lookup(0).unwrap();
+        assert_eq!(obj, CapObject::Frame { phys: 0xdead_b000 });
+        assert_eq!(r, CapRights::READ);
+    }
+
+    #[test]
+    fn insert_domain_e_lookup() {
+        let mut t = CapTable::new();
+        t.insert_root(0, CapObject::Domain { handle: 7 }, CapRights::ALL)
+            .unwrap();
+        match t.lookup(0).unwrap().0 {
+            CapObject::Domain { handle } => assert_eq!(handle, 7),
+            _ => panic!("esperava Domain"),
+        }
+    }
+
+    #[test]
+    fn rights_contains_propriedades() {
+        // Reflexivo
+        assert!(CapRights::ALL.contains(CapRights::ALL));
+        assert!(CapRights::READ.contains(CapRights::READ));
+        // NONE e subset de qualquer um
+        assert!(CapRights::ALL.contains(CapRights::NONE));
+        assert!(CapRights::NONE.contains(CapRights::NONE));
+        // ALL contem cada direito individual
+        assert!(CapRights::ALL.contains(CapRights::READ));
+        assert!(CapRights::ALL.contains(CapRights::WRITE));
+        assert!(CapRights::ALL.contains(CapRights::GRANT));
+        // Direitos individuais nao contem outros
+        assert!(!CapRights::READ.contains(CapRights::WRITE));
+        assert!(!CapRights::READ.contains(CapRights::ALL));
+    }
+
+    #[test]
+    fn copy_em_slot_ocupado_falha() {
+        let mut t = CapTable::new();
+        t.insert_root(0, mk_untyped(0, 4096), CapRights::ALL).unwrap();
+        t.insert_root(1, mk_untyped(0x2000, 4096), CapRights::ALL).unwrap();
+        assert_eq!(
+            t.copy(0, 1, CapRights::READ),
+            Err(CapError::SlotOccupied)
+        );
+    }
+
+    #[test]
+    fn retype_em_slot_dst_ocupado_falha() {
+        let mut t = CapTable::new();
+        t.insert_root(0, mk_untyped(0, 0x4000), CapRights::ALL).unwrap();
+        t.insert_root(1, mk_untyped(0x10_0000, 0x1000), CapRights::ALL).unwrap();
+        assert_eq!(
+            t.retype_untyped(0, 1, 0x1000),
+            Err(CapError::SlotOccupied)
         );
     }
 
