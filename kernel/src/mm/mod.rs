@@ -384,12 +384,15 @@ fn ensure_next_level(parent_phys: u64, idx: usize) -> Result<u64, PagingError> {
 /// - `phys` deve estar alinhado a 4 KiB.
 /// - `virt` nao pode colidir com um mapeamento ja presente de outra pagina
 ///   (retorna `InternalConflict`).
+/// - `perm` deve ser kernel (`Rx`/`Ro`/`Rw`/`Mmio`); paginas user-space
+///   passam por `map_user_page`. Auditoria via `assert!`.
 #[cfg(target_os = "none")]
 pub unsafe fn map_kernel_page(virt: u64, phys: u64, perm: Perm) -> Result<(), PagingError> {
     use crate::arch::x86_64::cpu;
     // assert!: ver justificativa em `map_range`. Mesma classe de bug.
     assert_eq!(virt & (frame::FRAME_SIZE - 1), 0, "map_kernel_page: virt desalinhado");
     assert_eq!(phys & (frame::FRAME_SIZE - 1), 0, "map_kernel_page: phys desalinhado");
+    assert!(!perm.is_user(), "map_kernel_page: Perm user proibido aqui");
     let pml4_phys = cpu::read_cr3() & paging::PTE_ADDR_MASK;
     map_4k(pml4_phys, virt, phys, perm)?;
     // TLB invalidate da pagina recem-mapeada: escritas anteriores em PTEs
@@ -397,4 +400,66 @@ pub unsafe fn map_kernel_page(virt: u64, phys: u64, perm: Perm) -> Result<(), Pa
     // traducao veja o novo mapeamento.
     unsafe { cpu::invlpg(virt); }
     Ok(())
+}
+
+/// Mapeia uma pagina de 4 KiB em ring 3 dentro do PML4 fornecido.
+/// Usado pela Phase 7a.6 (`domain::map`) apos auditar capability + W^X.
+///
+/// # Safety
+///
+/// - `pml4_phys` deve apontar para um PML4 valido alocado e cobrindo
+///   higher-half do kernel (ver `clone_kernel_higher_half`).
+/// - `virt` em lower-half (< 0x0000_8000_0000_0000) e canonico.
+/// - `phys` deve estar alinhado a 4 KiB.
+/// - `perm.is_user()` obrigatorio (assert!).
+/// - Caller responsavel por INVLPG quando trocar para `pml4_phys` via CR3.
+#[cfg(target_os = "none")]
+pub unsafe fn map_user_page(
+    pml4_phys: u64,
+    virt: u64,
+    phys: u64,
+    perm: Perm,
+) -> Result<(), PagingError> {
+    assert!(perm.is_user(), "map_user_page: Perm kernel proibido aqui");
+    assert_eq!(virt & (frame::FRAME_SIZE - 1), 0, "map_user_page: virt desalinhado");
+    assert_eq!(phys & (frame::FRAME_SIZE - 1), 0, "map_user_page: phys desalinhado");
+    // Lower-half: bits [63:47] devem ser zero (canonico user).
+    assert!(
+        virt < 0x0000_8000_0000_0000,
+        "map_user_page: virt fora do lower-half user"
+    );
+    map_4k(pml4_phys, virt, phys, perm)
+}
+
+/// Aloca um PML4 zerado e copia as entradas higher-half (kernel + physmap)
+/// do PML4 atualmente carregado. O dominio criado a seguir compartilha o
+/// kernel mapping (entradas 256..512) mas tem lower-half privado.
+///
+/// Compartilhamento e fundamental para que, durante uma syscall vinda de
+/// ring 3, a CPU continue resolvendo enderecos kernel sem trocar CR3
+/// (zero overhead em INT 0x80, isolamento via `PTE_USER`).
+///
+/// Retorna o endereco fisico do novo PML4.
+///
+/// # Safety
+///
+/// - Deve ser chamado apos `init_paging` (physmap ativo).
+/// - Kernel single-core; nenhuma escrita concorrente em PML4 atual.
+#[cfg(target_os = "none")]
+pub unsafe fn clone_kernel_higher_half() -> Result<u64, PagingError> {
+    use crate::arch::x86_64::cpu;
+    let new_pml4 = alloc_zeroed_table().ok_or(PagingError::OutOfFrames)?;
+    let cur = cpu::read_cr3() & paging::PTE_ADDR_MASK;
+    // SAFETY: `cur` e PML4 ativo; `new_pml4` recem-alocado e zerado.
+    // Ambos acessiveis via physmap. Copia 256 entries (higher-half).
+    unsafe {
+        let src = phys_to_virt(cur) as *const u64;
+        let dst = phys_to_virt(new_pml4) as *mut u64;
+        let mut i = 256usize;
+        while i < 512 {
+            dst.add(i).write(src.add(i).read());
+            i += 1;
+        }
+    }
+    Ok(new_pml4)
 }
