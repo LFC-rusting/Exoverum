@@ -188,6 +188,18 @@ __userland_payload_b_start:
     int 0x80
     ud2
 __userland_payload_b_end:
+
+    // Phase 8: handler de upcall trivial. Faz syscall=4 (upcall_return),
+    // que retorna ao ctx pre-upcall (entry normal do dominio).
+    .section .rodata.userland_upcall_handler, "a"
+    .globl __userland_upcall_handler_start
+    .globl __userland_upcall_handler_end
+    .balign 16
+__userland_upcall_handler_start:
+    mov rax, 4
+    int 0x80
+    ud2
+__userland_upcall_handler_end:
     "#
 );
 
@@ -197,6 +209,8 @@ extern "C" {
     static __userland_payload_a_target_offset: u64;
     static __userland_payload_b_start: u8;
     static __userland_payload_b_end: u8;
+    static __userland_upcall_handler_start: u8;
+    static __userland_upcall_handler_end: u8;
 }
 
 /// Bytes do payload do dominio A (cliente PCT). O caller deve
@@ -228,6 +242,17 @@ pub fn payload_a_target_imm_offset() -> usize {
 pub fn payload_b_bytes() -> &'static [u8] {
     let start = core::ptr::addr_of!(__userland_payload_b_start);
     let end = core::ptr::addr_of!(__userland_payload_b_end);
+    // SAFETY: idem.
+    unsafe {
+        let len = (end as usize) - (start as usize);
+        core::slice::from_raw_parts(start, len)
+    }
+}
+
+/// (Phase 8) Bytes do handler de upcall trivial.
+pub fn upcall_handler_bytes() -> &'static [u8] {
+    let start = core::ptr::addr_of!(__userland_upcall_handler_start);
+    let end = core::ptr::addr_of!(__userland_upcall_handler_end);
     // SAFETY: idem.
     unsafe {
         let len = (end as usize) - (start as usize);
