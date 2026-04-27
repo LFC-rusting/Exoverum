@@ -1,7 +1,8 @@
 //! GDT + TSS para long mode x86_64.
 //!
-//! Layout da GDT (selectors entre parenteses; ordem preservada para
-//! compatibilidade com SYSCALL/SYSRET em fases futuras):
+//! Layout da GDT (selectors entre parenteses; ordem fixada por SYSRET:
+//! ele exige user-data em STAR_HIGH+8 e user-code em STAR_HIGH+16, com
+//! STAR_HIGH = 0x10 implicando user-data 0x18 e user-code 0x20):
 //!   0 (0x00) null
 //!   1 (0x08) kernel code  DPL=0  L=1
 //!   2 (0x10) kernel data  DPL=0
@@ -10,8 +11,12 @@
 //!   5-6 (0x28) TSS descriptor de 16 bytes
 //!
 //! TSS guarda stacks de IRQ/excecao. Por ora so IST1 (double fault) recebe
-//! uma stack dedicada; RSP0 e demais slots ficam em zero ate termos
-//! userland (fase 7).
+//! uma stack dedicada; RSP0 sera preenchido em 7a.2 (entrada de SYSCALL
+//! precisa de stack de kernel quando viermos de ring 3).
+//!
+//! User segments (`USER_CS` e `USER_DS`) ja sao expostos com RPL=3
+//! embutido. Eles sao consumidos por `iretq` (entrada inicial em ring 3,
+//! 7a.3) e por SYSRET (retorno rapido, 7a.2).
 //!
 //! Invariante: `init` e chamado uma unica vez em kmain, antes de qualquer
 //! outra thread ou interrupcao. Por isso o acesso a `GDT`/`TSS` via
@@ -33,7 +38,44 @@ const GDT_USER_CODE: u64 = 0x00AF_FA00_0000_FFFF;
 /// Selectors expostos para uso por IDT e futuros handlers.
 pub const KERNEL_CS: u16 = 0x08;
 pub const KERNEL_DS: u16 = 0x10;
+/// User code segment com RPL=3 ja embutido; consumido por `iretq`/SYSRET.
+pub const USER_CS: u16 = 0x20 | 3;
+/// User data/stack segment com RPL=3 ja embutido.
+pub const USER_DS: u16 = 0x18 | 3;
 pub const TSS_SELECTOR: u16 = 0x28;
+
+// Const-asserts: protejo o layout dos descriptors contra regressao.
+// Cada acesso isola um campo no descriptor de 8 bytes (Intel SDM 3A 3.4.5):
+//   bit 47    = P (present)
+//   bits 45-46= DPL
+//   bit 44    = S (1 = code/data, 0 = system)
+//   bit 53    = L (long mode, so para code)
+//
+// Se algum bit for trocado por engano, o build quebra com mensagem clara
+// em vez de gerar um GP fault em runtime.
+const _: () = {
+    // Kernel code: P=1, DPL=0, S=1, L=1
+    assert!((GDT_KERNEL_CODE >> 47) & 1 == 1, "kernel code: P");
+    assert!((GDT_KERNEL_CODE >> 45) & 0b11 == 0, "kernel code: DPL");
+    assert!((GDT_KERNEL_CODE >> 44) & 1 == 1, "kernel code: S");
+    assert!((GDT_KERNEL_CODE >> 53) & 1 == 1, "kernel code: L");
+    // Kernel data: P=1, DPL=0, S=1
+    assert!((GDT_KERNEL_DATA >> 47) & 1 == 1, "kernel data: P");
+    assert!((GDT_KERNEL_DATA >> 45) & 0b11 == 0, "kernel data: DPL");
+    assert!((GDT_KERNEL_DATA >> 44) & 1 == 1, "kernel data: S");
+    // User code: P=1, DPL=3, S=1, L=1
+    assert!((GDT_USER_CODE >> 47) & 1 == 1, "user code: P");
+    assert!((GDT_USER_CODE >> 45) & 0b11 == 0b11, "user code: DPL");
+    assert!((GDT_USER_CODE >> 44) & 1 == 1, "user code: S");
+    assert!((GDT_USER_CODE >> 53) & 1 == 1, "user code: L");
+    // User data: P=1, DPL=3, S=1
+    assert!((GDT_USER_DATA >> 47) & 1 == 1, "user data: P");
+    assert!((GDT_USER_DATA >> 45) & 0b11 == 0b11, "user data: DPL");
+    assert!((GDT_USER_DATA >> 44) & 1 == 1, "user data: S");
+    // SYSRET impoe user-data = STAR_HIGH+8 e user-code = STAR_HIGH+16.
+    // Se trocarmos a ordem da GDT, este assert falha antes do boot.
+    assert!(USER_CS as u64 - 3 == (USER_DS as u64 - 3) + 8, "SYSRET layout");
+};
 
 static mut GDT: [u64; GDT_LEN] = [
     GDT_NULL,
@@ -92,6 +134,23 @@ static mut DF_STACK: [u8; IST_STACK_SIZE] = [0; IST_STACK_SIZE];
 struct GdtPtr {
     limit: u16,
     base: u64,
+}
+
+/// Define o RSP0 do TSS — a stack que a CPU carrega ao receber uma
+/// interrupcao/syscall vinda de ring 3. Sem isso, INT 0x80 a partir
+/// de userland causa #DF (CPU tenta empilhar o frame de excecao numa
+/// stack DPL=3 invalida).
+///
+/// Idempotente; pode ser chamado a qualquer momento, mas tipicamente
+/// uma vez antes de entrar em ring 3 pela primeira vez.
+pub fn set_rsp0(rsp0: u64) {
+    // SAFETY: kernel single-core; escrita exclusiva em TSS pos-init.
+    // TR ja foi carregado por `init`; CPU le RSP0 do TSS apontado por
+    // TR a cada transicao de privilegio.
+    unsafe {
+        let tss = core::ptr::addr_of_mut!(TSS);
+        (*tss).rsp0 = rsp0;
+    }
 }
 
 /// Inicializa GDT+TSS e carrega no core atual.
