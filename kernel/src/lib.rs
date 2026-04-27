@@ -35,4 +35,9 @@ pub mod thread;
 // `signal`, `wait`) cfg-gated em target_os="none".
 pub mod event;
 
+// `domain` (Phase 7a.4-7a.6): dominios ring 3 com CSpace propria e
+// CR3 proprio. Bare-metal-only (depende de mm::init_paging e arch).
+#[cfg(target_os = "none")]
+pub mod domain;
+
 mod panic;
