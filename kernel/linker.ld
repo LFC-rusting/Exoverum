@@ -37,6 +37,10 @@ SECTIONS {
     .rodata : AT(ADDR(.rodata) - KERNEL_VMA + KERNEL_LMA) ALIGN(0x1000) {
         __rodata_start = .;
         *(.rodata .rodata.*)
+        /* .got embutido em .rodata: e somente leitura no binario estatico
+         * (sem dynamic linking). Sem isto, .got cairia entre .rodata e
+         * .data e nao seria mapeada por mm::init_paging. */
+        *(.got .got.*)
         . = ALIGN(0x1000);
         __rodata_end = .;
     }
