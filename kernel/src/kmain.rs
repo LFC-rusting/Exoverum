@@ -7,15 +7,13 @@
 
 use bootinfo::BootInfo;
 
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::Ordering;
 
 use crate::arch::x86_64::{apic, cpu, gdt, idt, userland};
 use crate::cap::{CapObject, CapRights, CapTable};
 use crate::domain;
-use crate::event::{self, EventHandle};
 use crate::log;
 use crate::mm::{self, Perm};
-use crate::thread::{self, ThreadHandle};
 
 /// Entry point chamado pelo binario (`src/main.rs`).
 ///
@@ -114,17 +112,10 @@ pub unsafe fn start(bootinfo: *const BootInfo) -> ! {
     // com TSS IST + swapgs / syscalls).
     demo_timer();
 
-    // Phase 7a (7a.2 + 7a.3 + 7a.4 + 7a.5 + 7a.6): smoke test ring 3.
-    // Cria um dominio com CSpace propria + CR3 proprio (kernel higher-half
-    // clonado), insere caps de Frame, mapeia paginas user-RX/user-RW
-    // auditadas via cap, salta para ring 3 com iretq sintetico, payload
-    // executa duas syscalls via INT 0x80 (nop_test + exit) e o kernel
-    // halta. Funcao divergente.
-    //
-    // demo_events (Fase 6a) continua coberta pelos testes host de
-    // `event::tests` e `thread::tests` (18 + 14). A demo bare-metal
-    // foi superseded por demo_userland: 7a valida transicoes mais
-    // fundamentais (ring0<->ring3, audit de PTE, isolamento via CSpace).
+    // Phase 7a + 7b: smoke test ring 3 multi-dominio.
+    // - 7a: cria dominios com CR3+CSpace proprios, audita PTEs.
+    // - 7b: cap_grant entre dominios, PCT (domain_call/reply),
+    //   timer upcall ao dominio em execucao, scaffolding fora.
     demo_userland();
 }
 
@@ -149,227 +140,140 @@ fn demo_timer() {
     log::write_str("[kernel] timer demo done; 3 ticks observados\n");
 }
 
-// Statics compartilhados entre as threads de `demo_events`. `u8::MAX`
-// e sentinela invalido; sobrescritos por `demo_events` apos `spawn`/
-// `event::create`. Entry-points leem aqui para descobrir peer e eventos.
-//
-// SCAFFOLDING: estes statics + ev_a_entry/ev_b_entry/demo_events
-// servem so para a demo bare-metal de Fase 6a, hoje supersedida por
-// demo_userland (Fase 7a). Os contratos continuam validados por
-// testes host em `event::tests` e `thread::tests`. Saem na Phase 7b
-// junto com `thread.rs` e `event.rs` do kernel.
-#[allow(dead_code)]
-static EV_THREAD_A: AtomicU8 = AtomicU8::new(u8::MAX);
-#[allow(dead_code)]
-static EV_THREAD_B: AtomicU8 = AtomicU8::new(u8::MAX);
-#[allow(dead_code)]
-static E1: AtomicU8 = AtomicU8::new(u8::MAX);
-#[allow(dead_code)]
-static E2: AtomicU8 = AtomicU8::new(u8::MAX);
-
-#[allow(dead_code)]
-extern "sysv64" fn ev_a_entry() -> ! {
-    // SAFETY: este corpo executa apos `demo_events` ter (a) populado
-    // EV_THREAD_B + E1 + E2 e (b) cedido para A. Os handles
-    // reconstruidos por `from_raw` apontam para slots vivos que nao
-    // sao destruidos nesta fase. `wait`/`signal`/`yield_to` cumprem
-    // seus requisitos individuais (post-init, single-core, handle
-    // valido, fallback != self).
-    unsafe {
-        let b = ThreadHandle::from_raw(EV_THREAD_B.load(Ordering::Relaxed));
-        let e1 = EventHandle::from_raw(E1.load(Ordering::Relaxed));
-        let e2 = EventHandle::from_raw(E2.load(Ordering::Relaxed));
-
-        // 1) Cede a B para que ele faca signal(e1) sem waiter (sticky).
-        log::write_str("[kernel] ev_a yield_to B (setup sticky)\n");
-        let _ = thread::yield_to(b);
-
-        // 2) e1 deve estar Signaled; wait consome imediato sem parkear.
-        log::write_str("[kernel] ev_a wait(e1) (sticky deve consumir)\n");
-        let _ = event::wait(e1, b);
-        log::write_str("[kernel] ev_a consumiu e1 sticky\n");
-
-        // 3) Agora wait(e2) com e2 Clear: parkea, cede a B.
-        log::write_str("[kernel] ev_a wait(e2) (deve parkear)\n");
-        let _ = event::wait(e2, b);
-        // 5) Voltamos aqui depois que B signalar e2 e ceder a CPU.
-        log::write_str("[kernel] ev_a acordou de wait(e2)\n");
-    }
-    log::write_str("[kernel] events demo done\n");
-    cpu::halt_forever();
-}
-
-#[allow(dead_code)]
-extern "sysv64" fn ev_b_entry() -> ! {
-    // SAFETY: simetrica a `ev_a_entry`.
-    unsafe {
-        let a = ThreadHandle::from_raw(EV_THREAD_A.load(Ordering::Relaxed));
-        let e1 = EventHandle::from_raw(E1.load(Ordering::Relaxed));
-        let e2 = EventHandle::from_raw(E2.load(Ordering::Relaxed));
-
-        // signal(e1) sem waiter -> sticky.
-        log::write_str("[kernel] ev_b signal(e1) (sticky)\n");
-        let _ = event::signal(e1);
-        let _ = thread::yield_to(a);
-
-        // 4) signal(e2) com A parkeada -> consome bit + acorda A (Ready).
-        log::write_str("[kernel] ev_b signal(e2) (acorda A)\n");
-        let _ = event::signal(e2);
-        // A esta Ready; cede explicitamente para que ela retorne de wait.
-        let _ = thread::yield_to(a);
-    }
-    // A halta ao final; este caminho fica como defensiva.
-    cpu::halt_forever();
-}
-
-/// Cria 2 eventos + 2 threads e exercita: (i) signal antes de wait
-/// (sticky); (ii) wait antes de signal (park-then-wake). Prova tambem
-/// spawn + yield_to com 4 trocas de contexto.
-#[allow(dead_code)]
-fn demo_events() -> ! {
-    // SAFETY: pos-init_paging + thread/event globals em estado Empty;
-    // `create`/`spawn` sao idempotentes do ponto-de-vista do contrato
-    // (single-core, slots disponiveis nesta fase).
-    let (e1, e2) = unsafe {
-        match (event::create(), event::create()) {
-            (Ok(a), Ok(b)) => (a, b),
-            _ => {
-                log::write_str("[kernel] event::create falhou\n");
-                cpu::halt_forever();
-            }
-        }
-    };
-    let (a, b) = unsafe {
-        match (thread::spawn(ev_a_entry), thread::spawn(ev_b_entry)) {
-            (Ok(x), Ok(y)) => (x, y),
-            _ => {
-                log::write_str("[kernel] spawn ev_a/ev_b falhou\n");
-                cpu::halt_forever();
-            }
-        }
-    };
-    EV_THREAD_A.store(a.raw(), Ordering::Relaxed);
-    EV_THREAD_B.store(b.raw(), Ordering::Relaxed);
-    E1.store(e1.raw(), Ordering::Relaxed);
-    E2.store(e2.raw(), Ordering::Relaxed);
-    log::write_str("[kernel] events demo: yield_to ev_a\n");
-    // SAFETY: a foi devolvido por spawn; thread Ready.
-    unsafe {
-        let _ = thread::yield_to(a);
-    }
-    // ev_a halta ao final; nao retornamos aqui.
-    cpu::halt_forever();
-}
-
-/// Phase 7a smoke test: cria um dominio, popula sua CSpace com duas caps
-/// `Frame`, mapeia paginas user-RX (payload) e user-RW (stack) auditadas
-/// pela cap, copia o payload para o frame fisico via physmap, instala
-/// TSS.RSP0 + IDT[0x80] DPL=3 e salta para ring 3 com `iretq` sintetico.
-/// O payload faz dois INT 0x80 (nop_test + exit) e o kernel halta.
+/// Phase 7a + 7b smoke test: dois dominios fazem PCT.
 ///
-/// Cobre simultaneamente: 7a.2 (entry/exit ring 3), 7a.3 (smoke test),
-/// 7a.4 (Domain object), 7a.5 (CSpace propria por dominio) e 7a.6
-/// (auditoria capability+W^X em map). 7a.7 (cap_grant cross-CSpace)
-/// continua pendente: ver README.
+/// Configuracao:
+///   - **A** (cliente PCT): payload `mov rax,2; mov rdi,B; int 0x80;
+///     mov rax,1; int 0x80; ud2`. Halta apos receber reply.
+///   - **B** (servidor PCT): payload `mov rax,3; mov rdi,0x42;
+///     int 0x80; ud2`. Devolve o valor 0x42 ao caller.
+///
+/// Cobre Phase 7a (entry/exit ring 3, audited paging, isolamento) +
+/// Phase 7b (cap_grant cross-CSpace, PCT sync). Timer upcall e
+/// instrumentado mas nao exercitado nesta demo (timer_handler com
+/// CPL=3 e domain.upcall_entry==0 = no-op silencioso).
+///
+/// Funcao divergente.
 fn demo_userland() -> ! {
-    // Lower-half user. PML4=0, PDPT=1 → 0x4000_0000 (1 GiB) e
-    // 0x5000_0000 (1.25 GiB). Bem longe da regiao de fluxo do bootloader.
-    const USER_PAYLOAD_VA: u64 = 0x0000_0000_4000_0000;
-    const USER_STACK_VA: u64 = 0x0000_0000_5000_0000;
+    const PAYLOAD_VA: u64 = 0x0000_0000_4000_0000;
+    const STACK_VA: u64 = 0x0000_0000_5000_0000;
 
     log::write_str("[kernel] demo_userland: setup\n");
 
-    let payload_frame = match mm::alloc_frame() {
-        Some(f) => f,
-        None => {
-            log::write_str("[kernel] demo_userland: sem frame para payload\n");
-            cpu::halt_forever();
-        }
+    // Cria os dois dominios primeiro para conhecer os handles. A
+    // ordem dos `create` define os handles 0 e 1.
+    let dh_a = match unsafe { domain::create() } {
+        Ok(h) => h,
+        Err(_) => fail("demo_userland: domain::create A falhou"),
     };
-    let stack_frame = match mm::alloc_frame() {
-        Some(f) => f,
-        None => {
-            log::write_str("[kernel] demo_userland: sem frame para stack\n");
-            cpu::halt_forever();
-        }
+    let dh_b = match unsafe { domain::create() } {
+        Ok(h) => h,
+        Err(_) => fail("demo_userland: domain::create B falhou"),
     };
 
-    // Copia payload (.rodata kernel) para o frame fisico via physmap.
-    // Loop byte-a-byte porque o intrinsic `copy_nonoverlapping` cai em
-    // codegen com SIMD/SSE que esta desabilitado neste alvo
-    // (rustflags `-sse,+soft-float`). Tamanho constante < 4 KiB.
-    let bytes = userland::payload_bytes();
-    if bytes.len() > 4096 {
-        log::write_str("[kernel] demo_userland: payload > 4 KiB\n");
-        cpu::halt_forever();
+    // Setup do payload de B antes de A (A precisa do handle de B no patch).
+    setup_domain(dh_b, userland::payload_b_bytes(), None, PAYLOAD_VA, STACK_VA);
+    // Patch de A: imm32 do `mov rdi, ?` recebe handle B.
+    let patch_off = userland::payload_a_target_imm_offset();
+    setup_domain(
+        dh_a,
+        userland::payload_a_bytes(),
+        Some((patch_off, dh_b.raw() as u32)),
+        PAYLOAD_VA,
+        STACK_VA,
+    );
+
+    // Phase 7b: A precisa de cap Domain{B} para autorizar PCT call.
+    // O kernel boot age como "criador" das duas LibOSes e instala isso
+    // diretamente. Em LibOSes futuras, isto viria via cap_grant de uma
+    // LibOS pai/orquestradora.
+    if domain::insert_root(
+        dh_a,
+        2,
+        CapObject::Domain { handle: dh_b.raw() },
+        CapRights::ALL,
+    )
+    .is_err()
+    {
+        fail("demo_userland: insert Domain{B} cap em A falhou");
     }
-    // SAFETY: physmap ativo (pos-init_paging); payload_frame.addr()
-    // recem-alocado e exclusivo. bytes em higher-half kernel RO.
+
+    // Demo de cap_grant cross-CSpace: A grant um Frame R-O para B no
+    // slot 5. Apenas exercita o mecanismo (B nao usa o frame nesta demo;
+    // ver README para o caminho completo).
+    if domain::cap_grant(dh_a, 0, dh_b, 5, CapRights::READ).is_err() {
+        fail("demo_userland: cap_grant A->B falhou");
+    }
+    log::write_str("[kernel] cap_grant A->B ok\n");
+
+    // TSS.RSP0 = stack dedicada para INT vindo de ring 3.
+    userland::install();
+
+    log::write_str("[kernel] demo_userland: enter A\n");
+    let user_rsp = STACK_VA + 0x1000;
+    // SAFETY: dh_a valido; payload e stack mapeados; RSP0 ok; IDT pronta.
+    let _ = unsafe { domain::enter(dh_a, PAYLOAD_VA, user_rsp) };
+    cpu::halt_forever();
+}
+
+/// Setup completo de um dominio: aloca payload+stack, copia bytes
+/// (com patch opcional), insere caps Frame R/RW, mapeia user-RX/RW,
+/// programa entry_rip/entry_rsp.
+fn setup_domain(
+    dh: domain::DomainHandle,
+    bytes: &[u8],
+    patch: Option<(usize, u32)>,
+    payload_va: u64,
+    stack_va: u64,
+) {
+    if bytes.len() > 4096 {
+        fail("setup_domain: payload > 4 KiB");
+    }
+    let pf = mm::alloc_frame().unwrap_or_else(|| fail("setup_domain: sem frame payload"));
+    let sf = mm::alloc_frame().unwrap_or_else(|| fail("setup_domain: sem frame stack"));
+
+    // Copia bytes via physmap (loop manual: target sem SSE).
+    // SAFETY: physmap ativo; pf recem-alocado; bytes em higher-half kernel.
     unsafe {
-        let dst = mm::phys_to_virt(payload_frame.addr());
+        let dst = mm::phys_to_virt(pf.addr());
         let src = bytes.as_ptr();
         let mut i = 0usize;
         while i < bytes.len() {
             dst.add(i).write(src.add(i).read());
             i += 1;
         }
+        if let Some((off, val)) = patch {
+            let bs = val.to_le_bytes();
+            let mut j = 0usize;
+            while j < 4 {
+                dst.add(off + j).write(bs[j]);
+                j += 1;
+            }
+        }
     }
 
-    // Cria dominio. SAFETY: pos-init_paging.
-    let dh = match unsafe { domain::create() } {
-        Ok(h) => h,
-        Err(_) => {
-            log::write_str("[kernel] demo_userland: domain::create falhou\n");
-            cpu::halt_forever();
-        }
-    };
-
-    // Popula CSpace do dominio com Frame caps (READ p/ payload, READ+WRITE
-    // p/ stack). Aqui o kernel age como "criador" do dominio; a forma
-    // "idiomatica" exokernel (cap_grant entre dominios) entra em 7a.7+.
     let read = CapRights::READ;
     let rw = CapRights(CapRights::READ.0 | CapRights::WRITE.0);
-    if domain::insert_root(dh, 0, CapObject::Frame { phys: payload_frame.addr() }, read).is_err()
-        || domain::insert_root(dh, 1, CapObject::Frame { phys: stack_frame.addr() }, rw).is_err()
+    if domain::insert_root(dh, 0, CapObject::Frame { phys: pf.addr() }, read).is_err()
+        || domain::insert_root(dh, 1, CapObject::Frame { phys: sf.addr() }, rw).is_err()
     {
-        log::write_str("[kernel] demo_userland: insert_root falhou\n");
-        cpu::halt_forever();
+        fail("setup_domain: insert caps falhou");
     }
-
-    // Mapeia paginas user no dominio com auditoria da cap.
-    // SAFETY: pos-init_paging; va lower-half; perm user (auditado).
-    let r1 = unsafe { domain::map(dh, USER_PAYLOAD_VA, 0, Perm::UserRx) };
-    let r2 = unsafe { domain::map(dh, USER_STACK_VA, 1, Perm::UserRw) };
+    // SAFETY: pos-init_paging; va lower-half; perm user.
+    let r1 = unsafe { domain::map(dh, payload_va, 0, Perm::UserRx) };
+    let r2 = unsafe { domain::map(dh, stack_va, 1, Perm::UserRw) };
     if r1.is_err() || r2.is_err() {
-        log::write_str("[kernel] demo_userland: domain::map falhou\n");
-        cpu::halt_forever();
+        fail("setup_domain: domain::map falhou");
     }
-
-    // Auditoria viva: tenta mapear payload com UserRw. Cap so tem READ;
-    // domain::map deve retornar InsufficientRights. Prova ring-fence.
-    // SAFETY: idem; espero erro.
-    let denied = unsafe { domain::map(dh, USER_PAYLOAD_VA + 0x1000, 0, Perm::UserRw) };
-    match denied {
-        Err(domain::DomainError::InsufficientRights) => {
-            log::write_str("[kernel] demo_userland: audit OK (Rw negado para cap READ)\n");
-        }
-        _ => {
-            log::write_str("[kernel] demo_userland: audit FALHOU (Rw indevidamente concedido)\n");
-            cpu::halt_forever();
-        }
+    if domain::set_entry(dh, payload_va, stack_va + 0x1000).is_err() {
+        fail("setup_domain: set_entry falhou");
     }
+}
 
-    // TSS.RSP0 = stack dedicada para INT vindo de ring 3. IDT[0x80] ja
-    // foi instalado por idt::init() apontando para userland::syscall_entry.
-    userland::install();
-
-    log::write_str("[kernel] demo_userland: entrando ring 3\n");
-    // user_rsp = topo da pagina de stack (cresce para baixo). Alinhamento
-    // 16 ja garantido pelo final da pagina.
-    let user_rsp = USER_STACK_VA + 0x1000;
-    // SAFETY: dh valido, mapeamentos prontos, RSP0 setado, IDT[0x80] pronto.
-    let _ = unsafe { domain::enter(dh, USER_PAYLOAD_VA, user_rsp) };
-    // domain::enter so retorna em caso de erro de validacao do handle.
+fn fail(msg: &str) -> ! {
+    log::write_str("[kernel] ");
+    log::write_str(msg);
+    log::write_str("\n");
     cpu::halt_forever();
 }
 
