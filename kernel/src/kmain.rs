@@ -9,11 +9,12 @@ use bootinfo::BootInfo;
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
-use crate::arch::x86_64::{apic, cpu, gdt, idt};
+use crate::arch::x86_64::{apic, cpu, gdt, idt, userland};
 use crate::cap::{CapObject, CapRights, CapTable};
+use crate::domain;
 use crate::event::{self, EventHandle};
 use crate::log;
-use crate::mm;
+use crate::mm::{self, Perm};
 use crate::thread::{self, ThreadHandle};
 
 /// Entry point chamado pelo binario (`src/main.rs`).
@@ -113,12 +114,18 @@ pub unsafe fn start(bootinfo: *const BootInfo) -> ! {
     // com TSS IST + swapgs / syscalls).
     demo_timer();
 
-    // Fase 6a: eventos single-bit idempotentes. Spawn duas threads que
-    // exercitam (i) signal sticky consumido por wait posterior e
-    // (ii) wait que parkeia + signal que acorda + yield_to que ressuscita.
-    // Tambem exercita spawn+yield_to da Fase 5a (4 trocas de contexto).
-    // Funcao divergente: A halta ao final.
-    demo_events();
+    // Phase 7a (7a.2 + 7a.3 + 7a.4 + 7a.5 + 7a.6): smoke test ring 3.
+    // Cria um dominio com CSpace propria + CR3 proprio (kernel higher-half
+    // clonado), insere caps de Frame, mapeia paginas user-RX/user-RW
+    // auditadas via cap, salta para ring 3 com iretq sintetico, payload
+    // executa duas syscalls via INT 0x80 (nop_test + exit) e o kernel
+    // halta. Funcao divergente.
+    //
+    // demo_events (Fase 6a) continua coberta pelos testes host de
+    // `event::tests` e `thread::tests` (18 + 14). A demo bare-metal
+    // foi superseded por demo_userland: 7a valida transicoes mais
+    // fundamentais (ring0<->ring3, audit de PTE, isolamento via CSpace).
+    demo_userland();
 }
 
 /// Inicializa LAPIC, habilita IRQ 0x40, espera 3 ticks e desliga
@@ -145,11 +152,22 @@ fn demo_timer() {
 // Statics compartilhados entre as threads de `demo_events`. `u8::MAX`
 // e sentinela invalido; sobrescritos por `demo_events` apos `spawn`/
 // `event::create`. Entry-points leem aqui para descobrir peer e eventos.
+//
+// SCAFFOLDING: estes statics + ev_a_entry/ev_b_entry/demo_events
+// servem so para a demo bare-metal de Fase 6a, hoje supersedida por
+// demo_userland (Fase 7a). Os contratos continuam validados por
+// testes host em `event::tests` e `thread::tests`. Saem na Phase 7b
+// junto com `thread.rs` e `event.rs` do kernel.
+#[allow(dead_code)]
 static EV_THREAD_A: AtomicU8 = AtomicU8::new(u8::MAX);
+#[allow(dead_code)]
 static EV_THREAD_B: AtomicU8 = AtomicU8::new(u8::MAX);
+#[allow(dead_code)]
 static E1: AtomicU8 = AtomicU8::new(u8::MAX);
+#[allow(dead_code)]
 static E2: AtomicU8 = AtomicU8::new(u8::MAX);
 
+#[allow(dead_code)]
 extern "sysv64" fn ev_a_entry() -> ! {
     // SAFETY: este corpo executa apos `demo_events` ter (a) populado
     // EV_THREAD_B + E1 + E2 e (b) cedido para A. Os handles
@@ -181,6 +199,7 @@ extern "sysv64" fn ev_a_entry() -> ! {
     cpu::halt_forever();
 }
 
+#[allow(dead_code)]
 extern "sysv64" fn ev_b_entry() -> ! {
     // SAFETY: simetrica a `ev_a_entry`.
     unsafe {
@@ -206,6 +225,7 @@ extern "sysv64" fn ev_b_entry() -> ! {
 /// Cria 2 eventos + 2 threads e exercita: (i) signal antes de wait
 /// (sticky); (ii) wait antes de signal (park-then-wake). Prova tambem
 /// spawn + yield_to com 4 trocas de contexto.
+#[allow(dead_code)]
 fn demo_events() -> ! {
     // SAFETY: pos-init_paging + thread/event globals em estado Empty;
     // `create`/`spawn` sao idempotentes do ponto-de-vista do contrato
@@ -238,6 +258,118 @@ fn demo_events() -> ! {
         let _ = thread::yield_to(a);
     }
     // ev_a halta ao final; nao retornamos aqui.
+    cpu::halt_forever();
+}
+
+/// Phase 7a smoke test: cria um dominio, popula sua CSpace com duas caps
+/// `Frame`, mapeia paginas user-RX (payload) e user-RW (stack) auditadas
+/// pela cap, copia o payload para o frame fisico via physmap, instala
+/// TSS.RSP0 + IDT[0x80] DPL=3 e salta para ring 3 com `iretq` sintetico.
+/// O payload faz dois INT 0x80 (nop_test + exit) e o kernel halta.
+///
+/// Cobre simultaneamente: 7a.2 (entry/exit ring 3), 7a.3 (smoke test),
+/// 7a.4 (Domain object), 7a.5 (CSpace propria por dominio) e 7a.6
+/// (auditoria capability+W^X em map). 7a.7 (cap_grant cross-CSpace)
+/// continua pendente: ver README.
+fn demo_userland() -> ! {
+    // Lower-half user. PML4=0, PDPT=1 → 0x4000_0000 (1 GiB) e
+    // 0x5000_0000 (1.25 GiB). Bem longe da regiao de fluxo do bootloader.
+    const USER_PAYLOAD_VA: u64 = 0x0000_0000_4000_0000;
+    const USER_STACK_VA: u64 = 0x0000_0000_5000_0000;
+
+    log::write_str("[kernel] demo_userland: setup\n");
+
+    let payload_frame = match mm::alloc_frame() {
+        Some(f) => f,
+        None => {
+            log::write_str("[kernel] demo_userland: sem frame para payload\n");
+            cpu::halt_forever();
+        }
+    };
+    let stack_frame = match mm::alloc_frame() {
+        Some(f) => f,
+        None => {
+            log::write_str("[kernel] demo_userland: sem frame para stack\n");
+            cpu::halt_forever();
+        }
+    };
+
+    // Copia payload (.rodata kernel) para o frame fisico via physmap.
+    // Loop byte-a-byte porque o intrinsic `copy_nonoverlapping` cai em
+    // codegen com SIMD/SSE que esta desabilitado neste alvo
+    // (rustflags `-sse,+soft-float`). Tamanho constante < 4 KiB.
+    let bytes = userland::payload_bytes();
+    if bytes.len() > 4096 {
+        log::write_str("[kernel] demo_userland: payload > 4 KiB\n");
+        cpu::halt_forever();
+    }
+    // SAFETY: physmap ativo (pos-init_paging); payload_frame.addr()
+    // recem-alocado e exclusivo. bytes em higher-half kernel RO.
+    unsafe {
+        let dst = mm::phys_to_virt(payload_frame.addr());
+        let src = bytes.as_ptr();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            dst.add(i).write(src.add(i).read());
+            i += 1;
+        }
+    }
+
+    // Cria dominio. SAFETY: pos-init_paging.
+    let dh = match unsafe { domain::create() } {
+        Ok(h) => h,
+        Err(_) => {
+            log::write_str("[kernel] demo_userland: domain::create falhou\n");
+            cpu::halt_forever();
+        }
+    };
+
+    // Popula CSpace do dominio com Frame caps (READ p/ payload, READ+WRITE
+    // p/ stack). Aqui o kernel age como "criador" do dominio; a forma
+    // "idiomatica" exokernel (cap_grant entre dominios) entra em 7a.7+.
+    let read = CapRights::READ;
+    let rw = CapRights(CapRights::READ.0 | CapRights::WRITE.0);
+    if domain::insert_root(dh, 0, CapObject::Frame { phys: payload_frame.addr() }, read).is_err()
+        || domain::insert_root(dh, 1, CapObject::Frame { phys: stack_frame.addr() }, rw).is_err()
+    {
+        log::write_str("[kernel] demo_userland: insert_root falhou\n");
+        cpu::halt_forever();
+    }
+
+    // Mapeia paginas user no dominio com auditoria da cap.
+    // SAFETY: pos-init_paging; va lower-half; perm user (auditado).
+    let r1 = unsafe { domain::map(dh, USER_PAYLOAD_VA, 0, Perm::UserRx) };
+    let r2 = unsafe { domain::map(dh, USER_STACK_VA, 1, Perm::UserRw) };
+    if r1.is_err() || r2.is_err() {
+        log::write_str("[kernel] demo_userland: domain::map falhou\n");
+        cpu::halt_forever();
+    }
+
+    // Auditoria viva: tenta mapear payload com UserRw. Cap so tem READ;
+    // domain::map deve retornar InsufficientRights. Prova ring-fence.
+    // SAFETY: idem; espero erro.
+    let denied = unsafe { domain::map(dh, USER_PAYLOAD_VA + 0x1000, 0, Perm::UserRw) };
+    match denied {
+        Err(domain::DomainError::InsufficientRights) => {
+            log::write_str("[kernel] demo_userland: audit OK (Rw negado para cap READ)\n");
+        }
+        _ => {
+            log::write_str("[kernel] demo_userland: audit FALHOU (Rw indevidamente concedido)\n");
+            cpu::halt_forever();
+        }
+    }
+
+    // TSS.RSP0 = stack dedicada para INT vindo de ring 3. IDT[0x80] ja
+    // foi instalado por idt::init() apontando para userland::syscall_entry.
+    userland::install();
+
+    log::write_str("[kernel] demo_userland: entrando ring 3\n");
+    // user_rsp = topo da pagina de stack (cresce para baixo). Alinhamento
+    // 16 ja garantido pelo final da pagina.
+    let user_rsp = USER_STACK_VA + 0x1000;
+    // SAFETY: dh valido, mapeamentos prontos, RSP0 setado, IDT[0x80] pronto.
+    let _ = unsafe { domain::enter(dh, USER_PAYLOAD_VA, user_rsp) };
+    // domain::enter so retorna em caso de erro de validacao do handle.
     cpu::halt_forever();
 }
 
