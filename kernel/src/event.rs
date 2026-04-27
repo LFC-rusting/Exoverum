@@ -2,6 +2,24 @@
 //!
 //! Fase 6a da arquitetura. **Mecanismo puro, zero politica.**
 //!
+//! # ⚠ SCAFFOLDING TRANSITORIO (a remover na Phase 7)
+//!
+//! Aegis (Engler95) **nao tem primitiva de evento**: o equivalente vem
+//! naturalmente de excecao/interrupt -> upcall + PCT. Este modulo existe
+//! para validar a transicao `Ready <-> Waiting` em threads cooperativas
+//! *antes* de termos user-mode (Phase 7).
+//!
+//! Plano de remocao: junto com `thread.rs`, na Phase 7. Excecoes de
+//! hardware viram upcalls para a LibOS, e a propria LibOS materializa
+//! "evento", "semaforo", "condvar", "monitor" em userland sobre PCT.
+//!
+//! Independencia da LibOS:
+//!   - Kernel nao depende deste modulo. Removendo `event.rs`, somente
+//!     o `demo_events` em `kmain` quebra; o kernel propriamente dito
+//!     boota ate halt sem problemas.
+//!   - Sem semantica POSIX/Unix: nao e `signal(2)`, nao e `pthread_cond_*`,
+//!     nao tem payload, fila, prioridade. E literalmente um bit + waiter.
+//!
 //! # Modelo
 //!
 //! Um `Event` e uma celula de 1 bit com estado `Clear` ou `Signaled`
