@@ -31,4 +31,8 @@ pub mod cap;
 // (spawn, yield_to) ficam cfg-gated em target_os="none".
 pub mod thread;
 
+// `event` (Fase 6a): FSM pura host-testavel; API bare-metal (`create`,
+// `signal`, `wait`) cfg-gated em target_os="none".
+pub mod event;
+
 mod panic;
