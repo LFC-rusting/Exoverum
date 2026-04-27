@@ -32,7 +32,7 @@ capability model and CDT-based revoke.
 ## Status
 
 Hard code budget: total Rust source stays at **≤ 5k LoC**. Current footprint
-is roughly 3.5k LoC (kernel ~2.3k, bootloader ~1.1k, shared ABI crate ~80).
+is roughly 3.9k LoC (kernel ~2.8k, bootloader ~1.1k, shared ABI crate ~80).
 
 Phases below are the roadmap from boot to a usable LibOS. Each phase only
 delivers *mechanism*: schedulers, IPC protocols, filesystems and any other
@@ -95,10 +95,10 @@ management*).
   transition before user-mode exists. **This phase is scaffolding**:
   Aegis (Engler-1995 §4) has neither in-kernel threads nor a separate
   event primitive — the equivalent emerges naturally from
-  exception/interrupt upcalls plus protected control transfer. Phase 7
+  exception/interrupt upcalls plus protected control transfer. Phase 7b
   removes both `thread.rs` and `event.rs` from the kernel.
 
-- **Phase 7 — exokernel proper** (pending). **Kernel mechanisms only.**
+- **Phase 7 — exokernel proper** (in progress). **Kernel mechanisms only.**
   Phase 7 does **not** create a LibOS, an OS personality, a runtime, or
   any user-space library. It only adds the kernel primitives that make
   user-space domains *possible*. Validation uses a minimal in-tree
@@ -109,22 +109,36 @@ management*).
 
   Two parts only:
 
-  - **7a — Domains & exposed paging.** Ring-3 isolation, multiple
-    address spaces, multiple capability spaces, page-table format
-    owned by each domain (kernel only audits each PTE against the
-    owning capabilities, enforces W^X/NX, and loads CR3). Mediated
-    capability transfer between domains preserving the derivation
-    tree.
+  - **7a — Domains & exposed paging** (mostly done). Ring-3 isolation,
+    multiple address spaces, multiple capability spaces, page-table
+    format owned by each domain (kernel only audits each PTE against
+    the owning capabilities, enforces W^X/NX, and loads CR3).
 
-  - **7b — Upcalls & control transfer.** Exception and timer dispatch
-    delivered as upcalls to the active domain (kernel demultiplexes;
-    the domain handles). Protected control transfer (synchronous and
-    asynchronous, optionally donating the remaining quantum) as the
-    only IPC primitive. Visible revocation protocol with the
-    repossession vector. With these in place, `thread.rs` and
-    `event.rs` leave the kernel; whoever runs in ring 3 implements
-    its own threads and synchronization on top of PCT and upcalls.
-    Multiple ring-3 domains coexist; none is privileged by the kernel.
+    Delivered (sub-steps 7a.1–7a.6):
+    user GDT segments with const-asserts, INT 0x80 syscall path with
+    DPL=3 gate and dedicated kernel stack, ring-3 entry via synthetic
+    `iretq`, `Domain` object with own CR3 and own `CapTable`,
+    `Frame`/`Domain` capability variants, `domain::map` auditing
+    capability rights against W^X bits before writing PTEs.
+
+    Pending (7a.7): mediated capability transfer between domains
+    (`cap_grant`) preserving the derivation tree across CSpaces. The
+    minimal implementation requires extending the CDT to global
+    cross-CSpace identifiers, which is a non-trivial refactor of
+    `cap.rs`. Decision: **fold 7a.7 into 7b**, where the same global
+    CDT also serves the visible revocation protocol; deduplicates work.
+
+  - **7b — Upcalls, control transfer & cross-domain capabilities.**
+    Exception and timer dispatch delivered as upcalls to the active
+    domain (kernel demultiplexes; the domain handles). Protected
+    control transfer (synchronous and asynchronous, optionally
+    donating the remaining quantum) as the only IPC primitive.
+    Visible revocation protocol with the repossession vector.
+    Cross-CSpace `cap_grant` preserving the derivation tree (folded
+    in from 7a.7). With these in place, `thread.rs` and `event.rs`
+    leave the kernel; whoever runs in ring 3 implements its own
+    threads and synchronization on top of PCT and upcalls. Multiple
+    ring-3 domains coexist; none is privileged by the kernel.
 
   The kernel guarantees only capability validation, domain isolation
   and correct context switch. Message formats, buffering, scheduling
@@ -159,10 +173,12 @@ kernel/                 Bare-metal ELF binary
   src/arch/x86_64/      cpu / gdt / idt / serial (unsafe isolated)
   src/mm/               frame, paging (+ unsafe boundary in mod.rs)
   src/cap.rs            capabilities flat-table + CDT + global revoke
-  src/thread.rs         Thread Control Blocks + spawn + yield_to (SCAFFOLDING; removed in Phase 7)
-  src/event.rs          single-bit idempotent events + park/wake (SCAFFOLDING; removed in Phase 7)
-  src/arch/x86_64/context.rs  switch_context (#[unsafe(naked)] + SysV)
-  src/arch/x86_64/apic.rs     LAPIC init + timer one-shot + EOI (Phase 5b)
+  src/domain.rs         ring-3 Domain (own CR3 + own CapTable) + audited map (Phase 7a)
+  src/thread.rs         Thread Control Blocks + spawn + yield_to (SCAFFOLDING; removed in Phase 7b)
+  src/event.rs          single-bit idempotent events + park/wake (SCAFFOLDING; removed in Phase 7b)
+  src/arch/x86_64/context.rs   switch_context (#[unsafe(naked)] + SysV)
+  src/arch/x86_64/apic.rs      LAPIC init + timer one-shot + EOI (Phase 5b)
+  src/arch/x86_64/userland.rs  ring-3 entry (iretq) + INT 0x80 syscall (Phase 7a)
   linker.ld             kernel layout (VMA 0xFFFFFFFF80200000, LMA 0x200000)
 ```
 
@@ -206,16 +222,16 @@ On `make run` the expected serial trace is:
 [kernel] timer tick
 [kernel] timer tick
 [kernel] timer demo done; 3 ticks observados
-[kernel] events demo: yield_to ev_a
-[kernel] ev_a yield_to B (setup sticky)     <-- 4 cooperative
-[kernel] ev_b signal(e1) (sticky)           <-- context switches
-[kernel] ev_a wait(e1) (sticky deve consumir)
-[kernel] ev_a consumiu e1 sticky            <-- sticky-bit consumed
-[kernel] ev_a wait(e2) (deve parkear)
-[kernel] ev_b signal(e2) (acorda A)         <-- park-then-wake
-[kernel] ev_a acordou de wait(e2)
-[kernel] events demo done
+[kernel] demo_userland: setup
+[kernel] demo_userland: audit OK (Rw negado para cap READ)  <-- capability audit
+[kernel] demo_userland: entrando ring 3                      <-- iretq to ring 3
+[kernel] ring 3 -> kernel via INT 0x80 (nop_test)            <-- syscall round trip
+[kernel] ring 3 exit; halting                                <-- ring 3 -> halt
 ```
+
+Phase 6a (events) is no longer exercised at boot but its 18 host
+tests in `event::tests`/`thread::tests` still run via `make test`.
+The scaffolding leaves the kernel in Phase 7b.
 
 ## Security rules (binding)
 
