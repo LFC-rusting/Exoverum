@@ -140,28 +140,39 @@ fn demo_timer() {
     log::write_str("[kernel] timer demo done; 3 ticks observados\n");
 }
 
-/// Phase 7a + 7b smoke test: dois dominios fazem PCT.
+/// Phases 7a/7b/8 smoke test: dois dominios em ring 3 exercitam o
+/// caminho completo do exokernel.
 ///
-/// Configuracao:
-///   - **A** (cliente PCT): payload `mov rax,2; mov rdi,B; int 0x80;
-///     mov rax,1; int 0x80; ud2`. Halta apos receber reply.
-///   - **B** (servidor PCT): payload `mov rax,3; mov rdi,0x42;
-///     int 0x80; ud2`. Devolve o valor 0x42 ao caller.
+///   - **A** (cliente): faz `domain_call(B)`, espera o reply, sai.
+///   - **B** (servidor): tem dois pontos de entrada — uma entry normal
+///     que devolve 0x42 via `domain_reply`, e um upcall handler que
+///     so chama `upcall_return`.
 ///
-/// Cobre Phase 7a (entry/exit ring 3, audited paging, isolamento) +
-/// Phase 7b (cap_grant cross-CSpace, PCT sync). Timer upcall e
-/// instrumentado mas nao exercitado nesta demo (timer_handler com
-/// CPL=3 e domain.upcall_entry==0 = no-op silencioso).
+/// Sequencia:
+///   1. setup A, B; A recebe `Domain{B}` (autoriza PCT) e da
+///      `cap_grant` de um Frame para B (slot 5).
+///   2. (Phase 8) Kernel chama `revoke_granted(A, 0)`: a cap doada para
+///      B e removida; B fica com `pending_upcall = Repossession`.
+///   3. `enter A`. A faz `domain_call(B)`.
+///   4. Kernel detecta pending_upcall; em vez de pular para a entry
+///      normal, dispara o upcall handler com `RDI = Repossession`.
+///   5. Handler faz `syscall=4 upcall_return`; B retoma sua entry
+///      normal e da `domain_reply(0x42)`.
+///   6. A continua, `mov rax,1; int 0x80` sai e o kernel halta.
+///
+/// Cobre: ring-3 isolation, audited paging, INT-0x80 syscall, PCT
+/// sync (call+reply), cap_grant, visible cross-CSpace revocation,
+/// repossession upcall pro-ativo, save/restore de UserContext em
+/// dois niveis (pct caller + pre-upcall).
 ///
 /// Funcao divergente.
 fn demo_userland() -> ! {
     const PAYLOAD_VA: u64 = 0x0000_0000_4000_0000;
     const STACK_VA: u64 = 0x0000_0000_5000_0000;
+    const UPCALL_VA: u64 = 0x0000_0000_6000_0000;
 
     log::write_str("[kernel] demo_userland: setup\n");
 
-    // Cria os dois dominios primeiro para conhecer os handles. A
-    // ordem dos `create` define os handles 0 e 1.
     let dh_a = match unsafe { domain::create() } {
         Ok(h) => h,
         Err(_) => fail("demo_userland: domain::create A falhou"),
@@ -171,9 +182,10 @@ fn demo_userland() -> ! {
         Err(_) => fail("demo_userland: domain::create B falhou"),
     };
 
-    // Setup do payload de B antes de A (A precisa do handle de B no patch).
     setup_domain(dh_b, userland::payload_b_bytes(), None, PAYLOAD_VA, STACK_VA);
-    // Patch de A: imm32 do `mov rdi, ?` recebe handle B.
+    // (Phase 8) Instala upcall handler em B reusando a stack de B.
+    setup_upcall(dh_b, userland::upcall_handler_bytes(), UPCALL_VA, STACK_VA);
+
     let patch_off = userland::payload_a_target_imm_offset();
     setup_domain(
         dh_a,
@@ -183,10 +195,6 @@ fn demo_userland() -> ! {
         STACK_VA,
     );
 
-    // Phase 7b: A precisa de cap Domain{B} para autorizar PCT call.
-    // O kernel boot age como "criador" das duas LibOSes e instala isso
-    // diretamente. Em LibOSes futuras, isto viria via cap_grant de uma
-    // LibOS pai/orquestradora.
     if domain::insert_root(
         dh_a,
         2,
@@ -198,15 +206,20 @@ fn demo_userland() -> ! {
         fail("demo_userland: insert Domain{B} cap em A falhou");
     }
 
-    // Demo de cap_grant cross-CSpace: A grant um Frame R-O para B no
-    // slot 5. Apenas exercita o mecanismo (B nao usa o frame nesta demo;
-    // ver README para o caminho completo).
     if domain::cap_grant(dh_a, 0, dh_b, 5, CapRights::READ).is_err() {
         fail("demo_userland: cap_grant A->B falhou");
     }
     log::write_str("[kernel] cap_grant A->B ok\n");
 
-    // TSS.RSP0 = stack dedicada para INT vindo de ring 3.
+    // (Phase 8) Visible cross-CSpace revocation: derruba a cap doada,
+    // marca pending_upcall em B. Sucesso = pelo menos 1 destino.
+    match domain::revoke_granted(dh_a, 0) {
+        Ok(n) if n >= 1 => {
+            log::write_str("[kernel] revoke_granted A.slot0 ok\n");
+        }
+        _ => fail("demo_userland: revoke_granted falhou"),
+    }
+
     userland::install();
 
     log::write_str("[kernel] demo_userland: enter A\n");
@@ -214,6 +227,42 @@ fn demo_userland() -> ! {
     // SAFETY: dh_a valido; payload e stack mapeados; RSP0 ok; IDT pronta.
     let _ = unsafe { domain::enter(dh_a, PAYLOAD_VA, user_rsp) };
     cpu::halt_forever();
+}
+
+/// (Phase 8) Mapeia o handler de upcall em `upcall_va` no dominio
+/// `dh` e programa `upcall_entry`/`upcall_stack`. A stack de upcall
+/// reusa `stack_va` da entry normal (handler trivial nao usa stack).
+fn setup_upcall(
+    dh: domain::DomainHandle,
+    bytes: &[u8],
+    upcall_va: u64,
+    stack_va: u64,
+) {
+    if bytes.len() > 4096 {
+        fail("setup_upcall: handler > 4 KiB");
+    }
+    let pf = mm::alloc_frame().unwrap_or_else(|| fail("setup_upcall: sem frame"));
+    // SAFETY: physmap ativo; pf recem-alocado.
+    unsafe {
+        let dst = mm::phys_to_virt(pf.addr());
+        let src = bytes.as_ptr();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            dst.add(i).write(src.add(i).read());
+            i += 1;
+        }
+    }
+    // Slot 3 nao colide com 0/1 (frames da entry) nem 5 (cap_grant).
+    if domain::insert_root(dh, 3, CapObject::Frame { phys: pf.addr() }, CapRights::READ).is_err() {
+        fail("setup_upcall: insert cap falhou");
+    }
+    // SAFETY: pos-init_paging; va lower-half; perm user.
+    if unsafe { domain::map(dh, upcall_va, 3, Perm::UserRx) }.is_err() {
+        fail("setup_upcall: map handler falhou");
+    }
+    if domain::set_upcall(dh, upcall_va, stack_va + 0x1000).is_err() {
+        fail("setup_upcall: set_upcall falhou");
+    }
 }
 
 /// Setup completo de um dominio: aloca payload+stack, copia bytes
