@@ -32,7 +32,7 @@ capability model and CDT-based revoke.
 ## Status
 
 Hard code budget: total Rust source stays at **≤ 5k LoC**. Current footprint
-is roughly 3.9k LoC (kernel ~2.8k, bootloader ~1.1k, shared ABI crate ~80).
+is roughly 3.7k LoC (kernel ~2.6k, bootloader ~1.1k, shared ABI crate ~80).
 
 Phases below are the roadmap from boot to a usable LibOS. Each phase only
 delivers *mechanism*: schedulers, IPC protocols, filesystems and any other
@@ -89,56 +89,62 @@ management*).
   that arrives, failing to respond within a fixed deadline triggers
   fail-stop (security > liveness).
 
-- **Phase 6 — Cooperative scaffolding** (done, transient). A single-bit
-  idempotent event primitive (`signal`/`wait`) used together with the
-  cooperative threads from Phase 5a to validate the `Ready` ↔ `Waiting`
-  transition before user-mode exists. **This phase is scaffolding**:
-  Aegis (Engler-1995 §4) has neither in-kernel threads nor a separate
-  event primitive — the equivalent emerges naturally from
-  exception/interrupt upcalls plus protected control transfer. Phase 7b
-  removes both `thread.rs` and `event.rs` from the kernel.
+- **Phase 6 — Cooperative scaffolding** (removed in Phase 7b). The
+  cooperative thread + single-bit event primitives that exercised
+  `Ready` ↔ `Waiting` transitions before user-mode existed have been
+  removed from the kernel. They are subsumed by ring-3 domains plus
+  PCT/upcalls (Aegis-style, Engler-1995 §4).
 
-- **Phase 7 — exokernel proper** (in progress). **Kernel mechanisms only.**
+- **Phase 7 — exokernel proper** (done). **Kernel mechanisms only.**
   Phase 7 does **not** create a LibOS, an OS personality, a runtime, or
   any user-space library. It only adds the kernel primitives that make
   user-space domains *possible*. Validation uses a minimal in-tree
-  ring-3 payload (a few instructions plus one syscall) as an
+  ring-3 payload (two domains, a few instructions each) as an
   integration smoke test, not as a LibOS. Real LibOSes, if ever built,
   live outside the kernel in their own directories and are
   substitutable; the kernel never assumes any of them.
 
-  Two parts only:
-
-  - **7a — Domains & exposed paging** (mostly done). Ring-3 isolation,
+  - **7a — Domains & exposed paging** (done). Ring-3 isolation,
     multiple address spaces, multiple capability spaces, page-table
     format owned by each domain (kernel only audits each PTE against
-    the owning capabilities, enforces W^X/NX, and loads CR3).
+    the owning capabilities, enforces W^X/NX, and loads CR3). User GDT
+    segments with const-asserts, INT 0x80 syscall path with DPL=3 gate
+    and dedicated kernel stack, `Domain` object with own CR3 and own
+    `CapTable`, `Frame`/`Domain` capability variants, `domain::map`
+    auditing capability rights against W^X bits before writing PTEs.
 
-    Delivered (sub-steps 7a.1–7a.6):
-    user GDT segments with const-asserts, INT 0x80 syscall path with
-    DPL=3 gate and dedicated kernel stack, ring-3 entry via synthetic
-    `iretq`, `Domain` object with own CR3 and own `CapTable`,
-    `Frame`/`Domain` capability variants, `domain::map` auditing
-    capability rights against W^X bits before writing PTEs.
+  - **7b — Upcalls, control transfer & cross-domain capabilities** (done).
+    A complete `UserContext` (15 GPRs + iret frame) is saved on the
+    syscall stack and exposed as `*mut UserContext` to the kernel
+    dispatcher; the dispatcher rewrites it in-place to switch domain
+    or to deliver an upcall, and the trampoline's `iretq` carries
+    whatever ring-3 state the kernel committed.
 
-    Pending (7a.7): mediated capability transfer between domains
-    (`cap_grant`) preserving the derivation tree across CSpaces. The
-    minimal implementation requires extending the CDT to global
-    cross-CSpace identifiers, which is a non-trivial refactor of
-    `cap.rs`. Decision: **fold 7a.7 into 7b**, where the same global
-    CDT also serves the visible revocation protocol; deduplicates work.
+    Delivered:
 
-  - **7b — Upcalls, control transfer & cross-domain capabilities.**
-    Exception and timer dispatch delivered as upcalls to the active
-    domain (kernel demultiplexes; the domain handles). Protected
-    control transfer (synchronous and asynchronous, optionally
-    donating the remaining quantum) as the only IPC primitive.
-    Visible revocation protocol with the repossession vector.
-    Cross-CSpace `cap_grant` preserving the derivation tree (folded
-    in from 7a.7). With these in place, `thread.rs` and `event.rs`
-    leave the kernel; whoever runs in ring 3 implements its own
-    threads and synchronization on top of PCT and upcalls. Multiple
-    ring-3 domains coexist; none is privileged by the kernel.
+    - **PCT sync** — `domain_call(target_dh)` (syscall 2) saves the
+      caller's `UserContext`, validates a `CapObject::Domain { handle:
+      target }` in the caller's CSpace, switches CR3 and resumes the
+      callee at its programmed entry; `domain_reply(value)` (syscall
+      3) restores the caller with `RAX = value`.
+    - **Upcall framework** — `Domain` exposes `upcall_entry`/
+      `upcall_stack`. Whenever the timer (or any future fault/repossession
+      vector) interrupts ring 3, the kernel saves `pre_upcall_ctx` and
+      rewrites the iret frame to dispatch into the domain's handler;
+      the handler returns via `upcall_return` (syscall 4). The timer
+      handler differentiates `CPL=0` (kernel: log + EOI + rearm) from
+      `CPL=3` (domain: deliver upcall) using the saved `cs & 3` bit.
+    - **`cap_grant`** — transfers a capability between distinct CSpaces
+      with monotonic rights attenuation. The granted cap lands as a
+      root in the destination CSpace; the type and the `phys`/`handle`
+      payload travel unchanged.
+    - **Scaffolding removed** — `thread.rs` and `event.rs` are gone
+      from the kernel. Whoever runs in ring 3 implements its own
+      threads and synchronization on top of PCT and upcalls.
+
+    Async PCT and visible cross-CSpace revocation are deferred to
+    Phase 8 (hardening): a global CDT spanning CSpaces is the natural
+    home for both, and they share the repossession-upcall machinery.
 
   The kernel guarantees only capability validation, domain isolation
   and correct context switch. Message formats, buffering, scheduling
@@ -172,13 +178,11 @@ kernel/                 Bare-metal ELF binary
   src/log.rs, panic.rs  logging + panic
   src/arch/x86_64/      cpu / gdt / idt / serial (unsafe isolated)
   src/mm/               frame, paging (+ unsafe boundary in mod.rs)
-  src/cap.rs            capabilities flat-table + CDT + global revoke
-  src/domain.rs         ring-3 Domain (own CR3 + own CapTable) + audited map (Phase 7a)
-  src/thread.rs         Thread Control Blocks + spawn + yield_to (SCAFFOLDING; removed in Phase 7b)
-  src/event.rs          single-bit idempotent events + park/wake (SCAFFOLDING; removed in Phase 7b)
-  src/arch/x86_64/context.rs   switch_context (#[unsafe(naked)] + SysV)
+  src/cap.rs            capabilities flat-table + CDT + global revoke (local)
+  src/domain.rs         Domain (CR3 + CSpace + entry/upcall/saved_ctx) + PCT + cap_grant
   src/arch/x86_64/apic.rs      LAPIC init + timer one-shot + EOI (Phase 5b)
-  src/arch/x86_64/userland.rs  ring-3 entry (iretq) + INT 0x80 syscall (Phase 7a)
+  src/arch/x86_64/userland.rs  ring-3 entry/exit + UserContext save/restore +
+                               syscall dispatch (5 calls) + timer upcall trampoline
   linker.ld             kernel layout (VMA 0xFFFFFFFF80200000, LMA 0x200000)
 ```
 
@@ -223,15 +227,24 @@ On `make run` the expected serial trace is:
 [kernel] timer tick
 [kernel] timer demo done; 3 ticks observados
 [kernel] demo_userland: setup
-[kernel] demo_userland: audit OK (Rw negado para cap READ)  <-- capability audit
-[kernel] demo_userland: entrando ring 3                      <-- iretq to ring 3
-[kernel] ring 3 -> kernel via INT 0x80 (nop_test)            <-- syscall round trip
-[kernel] ring 3 exit; halting                                <-- ring 3 -> halt
+[kernel] cap_grant A->B ok                                   <-- cross-CSpace transfer
+[kernel] demo_userland: enter A                              <-- iretq into ring 3 (A)
+[kernel] pct_call ok                                         <-- A.domain_call(B)
+[kernel] pct_reply ok                                        <-- B.domain_reply(0x42)
+[kernel] ring 3 exit; halting                                <-- A resumes, exits
 ```
 
-Phase 6a (events) is no longer exercised at boot but its 18 host
-tests in `event::tests`/`thread::tests` still run via `make test`.
-The scaffolding leaves the kernel in Phase 7b.
+The demo exercises every Phase 7 mechanism: ring-3 isolation
+(domains A and B with distinct CR3s and CSpaces), audited paging
+(`domain::map` rejects `UserRw` over a `CapRights::READ` cap),
+`cap_grant` (A grants `Frame` to B), PCT sync (`domain_call` /
+`domain_reply` with `RAX=0x42` carried back to A), and the timer
+handler differentiating ring-0 ticks from ring-3 ticks. The
+upcall framework (`UserContext` save/restore, `pre_upcall_ctx`,
+`syscall=4 upcall_return`) is wired end-to-end and exercised by
+the ring-0 timer path; ring-3 timer upcall is a no-op until a
+domain calls `set_upcall(...)`. Phase 8 will land a domain that
+actually subscribes to upcalls.
 
 ## Security rules (binding)
 
