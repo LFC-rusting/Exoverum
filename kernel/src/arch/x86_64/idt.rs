@@ -164,6 +164,12 @@ pub fn init() {
         let timer = timer_handler_entry as *const () as usize as u64;
         (*idt.add(super::apic::TIMER_VECTOR as usize))
             .set(timer, KERNEL_CS, 0, INTERRUPT_GATE);
+
+        // Phase 7a.2: vetor 0x80 = porta de syscall vinda de ring 3.
+        // type_attr 0xEE: P=1, DPL=3 (acessivel a user), Type=0xE (int gate).
+        const USER_INTERRUPT_GATE: u8 = 0xEE;
+        let syscall = super::userland::syscall_handler_addr();
+        (*idt.add(0x80)).set(syscall, KERNEL_CS, 0, USER_INTERRUPT_GATE);
     }
 
     let base = core::ptr::addr_of!(IDT) as u64;
