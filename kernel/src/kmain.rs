@@ -11,6 +11,7 @@ use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::arch::x86_64::{apic, cpu, gdt, idt};
 use crate::cap::{CapObject, CapRights, CapTable};
+use crate::event::{self, EventHandle};
 use crate::log;
 use crate::mm;
 use crate::thread::{self, ThreadHandle};
@@ -112,9 +113,12 @@ pub unsafe fn start(bootinfo: *const BootInfo) -> ! {
     // com TSS IST + swapgs / syscalls).
     demo_timer();
 
-    // Fase 5a: cooperative threading. Spawn duas threads que alternam
-    // CPU via `yield_to`. Funcao divergente: B halts no final.
-    demo_threads();
+    // Fase 6a: eventos single-bit idempotentes. Spawn duas threads que
+    // exercitam (i) signal sticky consumido por wait posterior e
+    // (ii) wait que parkeia + signal que acorda + yield_to que ressuscita.
+    // Tambem exercita spawn+yield_to da Fase 5a (4 trocas de contexto).
+    // Funcao divergente: A halta ao final.
+    demo_events();
 }
 
 /// Inicializa LAPIC, habilita IRQ 0x40, espera 3 ticks e desliga
@@ -138,76 +142,102 @@ fn demo_timer() {
     log::write_str("[kernel] timer demo done; 3 ticks observados\n");
 }
 
-// Handles compartilhados entre as duas threads do demo. Inicialmente
-// `u8::MAX` (sentinela invalido); preenchidos por `demo_threads` apos
-// `spawn`. Entry-points leem aqui para descobrir o peer.
-static THREAD_A: AtomicU8 = AtomicU8::new(u8::MAX);
-static THREAD_B: AtomicU8 = AtomicU8::new(u8::MAX);
+// Statics compartilhados entre as threads de `demo_events`. `u8::MAX`
+// e sentinela invalido; sobrescritos por `demo_events` apos `spawn`/
+// `event::create`. Entry-points leem aqui para descobrir peer e eventos.
+static EV_THREAD_A: AtomicU8 = AtomicU8::new(u8::MAX);
+static EV_THREAD_B: AtomicU8 = AtomicU8::new(u8::MAX);
+static E1: AtomicU8 = AtomicU8::new(u8::MAX);
+static E2: AtomicU8 = AtomicU8::new(u8::MAX);
 
-extern "sysv64" fn thread_a_entry() -> ! {
-    // SAFETY: este corpo executa APOS demo_threads ter (a) preenchido
-    // `THREAD_B` com o handle devolvido por `spawn` e (b) feito o primeiro
-    // `yield_to(A)`. Logo:
-    //  - `from_raw(THREAD_B)` reconstroi um handle que ainda existe (B nao
-    //    foi destruido; nao temos destroy nesta fase).
-    //  - `yield_to(b)` cumpre seus requisitos (post-init_paging, single-
-    //    core, handle valido).
-    // Cada chamada retorna quando B re-cede; entre elas o estado global
-    // permanece consistente (CURRENT atualizado dentro de yield_to).
+extern "sysv64" fn ev_a_entry() -> ! {
+    // SAFETY: este corpo executa apos `demo_events` ter (a) populado
+    // EV_THREAD_B + E1 + E2 e (b) cedido para A. Os handles
+    // reconstruidos por `from_raw` apontam para slots vivos que nao
+    // sao destruidos nesta fase. `wait`/`signal`/`yield_to` cumprem
+    // seus requisitos individuais (post-init, single-core, handle
+    // valido, fallback != self).
     unsafe {
-        let b = ThreadHandle::from_raw(THREAD_B.load(Ordering::Relaxed));
-        log::write_str("[kernel] thread A1\n");
+        let b = ThreadHandle::from_raw(EV_THREAD_B.load(Ordering::Relaxed));
+        let e1 = EventHandle::from_raw(E1.load(Ordering::Relaxed));
+        let e2 = EventHandle::from_raw(E2.load(Ordering::Relaxed));
+
+        // 1) Cede a B para que ele faca signal(e1) sem waiter (sticky).
+        log::write_str("[kernel] ev_a yield_to B (setup sticky)\n");
         let _ = thread::yield_to(b);
-        log::write_str("[kernel] thread A2\n");
-        let _ = thread::yield_to(b);
-        log::write_str("[kernel] thread A3\n");
-        let _ = thread::yield_to(b);
+
+        // 2) e1 deve estar Signaled; wait consome imediato sem parkear.
+        log::write_str("[kernel] ev_a wait(e1) (sticky deve consumir)\n");
+        let _ = event::wait(e1, b);
+        log::write_str("[kernel] ev_a consumiu e1 sticky\n");
+
+        // 3) Agora wait(e2) com e2 Clear: parkea, cede a B.
+        log::write_str("[kernel] ev_a wait(e2) (deve parkear)\n");
+        let _ = event::wait(e2, b);
+        // 5) Voltamos aqui depois que B signalar e2 e ceder a CPU.
+        log::write_str("[kernel] ev_a acordou de wait(e2)\n");
     }
-    // B vai halt; nao voltamos aqui. Defensivo:
+    log::write_str("[kernel] events demo done\n");
     cpu::halt_forever();
 }
 
-extern "sysv64" fn thread_b_entry() -> ! {
-    // SAFETY: simetrica a `thread_a_entry`. Quando este corpo executa,
-    // demo_threads ja preencheu `THREAD_A` e A acabou de ceder para B.
+extern "sysv64" fn ev_b_entry() -> ! {
+    // SAFETY: simetrica a `ev_a_entry`.
     unsafe {
-        let a = ThreadHandle::from_raw(THREAD_A.load(Ordering::Relaxed));
-        log::write_str("[kernel] thread B1\n");
+        let a = ThreadHandle::from_raw(EV_THREAD_A.load(Ordering::Relaxed));
+        let e1 = EventHandle::from_raw(E1.load(Ordering::Relaxed));
+        let e2 = EventHandle::from_raw(E2.load(Ordering::Relaxed));
+
+        // signal(e1) sem waiter -> sticky.
+        log::write_str("[kernel] ev_b signal(e1) (sticky)\n");
+        let _ = event::signal(e1);
         let _ = thread::yield_to(a);
-        log::write_str("[kernel] thread B2\n");
+
+        // 4) signal(e2) com A parkeada -> consome bit + acorda A (Ready).
+        log::write_str("[kernel] ev_b signal(e2) (acorda A)\n");
+        let _ = event::signal(e2);
+        // A esta Ready; cede explicitamente para que ela retorne de wait.
         let _ = thread::yield_to(a);
     }
-    log::write_str("[kernel] thread B3; threads done\n");
+    // A halta ao final; este caminho fica como defensiva.
     cpu::halt_forever();
 }
 
-/// Spawn duas threads que alternam CPU. A imprime A1, B imprime B1, A imprime
-/// A2, ... ate B3, halt. Prova `switch_context` + `spawn` + `yield_to` no boot.
-fn demo_threads() -> ! {
-    // SAFETY: pos-init_paging; spawn precisa do physmap ativo, ja temos.
-    let a = match unsafe { thread::spawn(thread_a_entry) } {
-        Ok(h) => h,
-        Err(_) => {
-            log::write_str("[kernel] spawn A falhou\n");
-            cpu::halt_forever();
+/// Cria 2 eventos + 2 threads e exercita: (i) signal antes de wait
+/// (sticky); (ii) wait antes de signal (park-then-wake). Prova tambem
+/// spawn + yield_to com 4 trocas de contexto.
+fn demo_events() -> ! {
+    // SAFETY: pos-init_paging + thread/event globals em estado Empty;
+    // `create`/`spawn` sao idempotentes do ponto-de-vista do contrato
+    // (single-core, slots disponiveis nesta fase).
+    let (e1, e2) = unsafe {
+        match (event::create(), event::create()) {
+            (Ok(a), Ok(b)) => (a, b),
+            _ => {
+                log::write_str("[kernel] event::create falhou\n");
+                cpu::halt_forever();
+            }
         }
     };
-    let b = match unsafe { thread::spawn(thread_b_entry) } {
-        Ok(h) => h,
-        Err(_) => {
-            log::write_str("[kernel] spawn B falhou\n");
-            cpu::halt_forever();
+    let (a, b) = unsafe {
+        match (thread::spawn(ev_a_entry), thread::spawn(ev_b_entry)) {
+            (Ok(x), Ok(y)) => (x, y),
+            _ => {
+                log::write_str("[kernel] spawn ev_a/ev_b falhou\n");
+                cpu::halt_forever();
+            }
         }
     };
-    THREAD_A.store(a.raw(), Ordering::Relaxed);
-    THREAD_B.store(b.raw(), Ordering::Relaxed);
-    log::write_str("[kernel] threads spawned; yield_to A\n");
-    // SAFETY: a foi devolvido por spawn acima; thread esta Ready.
+    EV_THREAD_A.store(a.raw(), Ordering::Relaxed);
+    EV_THREAD_B.store(b.raw(), Ordering::Relaxed);
+    E1.store(e1.raw(), Ordering::Relaxed);
+    E2.store(e2.raw(), Ordering::Relaxed);
+    log::write_str("[kernel] events demo: yield_to ev_a\n");
+    // SAFETY: a foi devolvido por spawn; thread Ready.
     unsafe {
         let _ = thread::yield_to(a);
     }
-    // B halts ao final, entao nao voltamos aqui. Mas no caso degenerado,
-    // halt explicito (este fn e divergente).
+    // ev_a halta ao final; nao retornamos aqui.
     cpu::halt_forever();
 }
 
