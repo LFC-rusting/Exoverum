@@ -47,9 +47,14 @@ pub const PTE_NO_EXECUTE: u64 = 1 << 63;
 pub const PTE_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
 /// Perfil de mapeamento W^X.
+///
+/// Variantes `User*` setam `PTE_USER` (DPL=3 acessivel) e sao a unica
+/// porta para PTEs de ring 3. O kernel jamais aceita uma `Perm` user
+/// numa pagina kernel-space (e vice-versa); essa auditoria fica em
+/// `domain::map` (Phase 7a.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Perm {
-    /// Read + Execute. Usado para `.text`.
+    /// Read + Execute. Usado para `.text` do kernel.
     Rx,
     /// Read-only (NX). Usado para `.rodata` e memory map apos parse.
     Ro,
@@ -59,6 +64,10 @@ pub enum Perm {
     /// (LAPIC, HPET etc.) — Intel SDM 10.4.1 exige UC para registradores
     /// memory-mapped. Caching would combine writes / return stale reads.
     Mmio,
+    /// Ring 3 read + execute. Sem WRITABLE; W^X garantido.
+    UserRx,
+    /// Ring 3 read + write (NX). Sem executavel; W^X garantido.
+    UserRw,
 }
 
 impl Perm {
@@ -71,7 +80,16 @@ impl Perm {
                 PTE_PRESENT | PTE_WRITABLE | PTE_NO_EXECUTE
                     | PTE_CACHE_DISABLE | PTE_WRITE_THROUGH
             }
+            Perm::UserRx => PTE_PRESENT | PTE_USER,
+            Perm::UserRw => {
+                PTE_PRESENT | PTE_USER | PTE_WRITABLE | PTE_NO_EXECUTE
+            }
         }
+    }
+
+    /// `true` se o perfil deve setar `PTE_USER` (acessivel em ring 3).
+    pub const fn is_user(self) -> bool {
+        matches!(self, Perm::UserRx | Perm::UserRw)
     }
 }
 
@@ -113,11 +131,14 @@ pub const fn make_pte(phys: u64, perm: Perm) -> u64 {
     (phys & PTE_ADDR_MASK) | perm.flags()
 }
 
-/// Entrada de tabela intermediaria (PML4->PDPT, etc). Sempre tem
-/// PRESENT+WRITABLE para permitir escrita posterior; o controle W^X
-/// final acontece apenas nos PTs-folha.
+/// Entrada de tabela intermediaria (PML4->PDPT, etc). Tem
+/// PRESENT+WRITABLE+USER. O bit USER em intermediarias e necessario
+/// para que walks de ring 3 cheguem ate as folhas user; folhas kernel
+/// continuam protegidas pelo seu proprio `PTE_USER=0` (Intel SDM 4.6.1:
+/// "user/supervisor flag in each paging-structure entry").
+/// O controle W^X final acontece nas folhas via `Perm`.
 pub const fn make_intermediate_pte(phys: u64) -> u64 {
-    (phys & PTE_ADDR_MASK) | PTE_PRESENT | PTE_WRITABLE
+    (phys & PTE_ADDR_MASK) | PTE_PRESENT | PTE_WRITABLE | PTE_USER
 }
 
 /// PTE de pagina gigante (1 GiB em PDPTE, ou 2 MiB em PDE). Marca bit PS.
@@ -166,6 +187,24 @@ mod tests {
         assert_eq!(Perm::Rx.flags() & PTE_WRITABLE, 0);
         assert_ne!(Perm::Rw.flags() & PTE_NO_EXECUTE, 0);
         assert_ne!(Perm::Ro.flags() & PTE_NO_EXECUTE, 0);
+    }
+
+    #[test]
+    fn perm_user_seta_user_bit_e_respeita_wx() {
+        let urx = Perm::UserRx.flags();
+        assert_ne!(urx & PTE_USER, 0, "UserRx exige PTE_USER (ring 3)");
+        assert_eq!(urx & PTE_WRITABLE, 0, "UserRx nunca escrevivel (W^X)");
+        assert_eq!(urx & PTE_NO_EXECUTE, 0, "UserRx executavel");
+
+        let urw = Perm::UserRw.flags();
+        assert_ne!(urw & PTE_USER, 0, "UserRw exige PTE_USER");
+        assert_ne!(urw & PTE_WRITABLE, 0);
+        assert_ne!(urw & PTE_NO_EXECUTE, 0, "UserRw nunca executavel (W^X)");
+
+        assert!(Perm::UserRx.is_user());
+        assert!(Perm::UserRw.is_user());
+        assert!(!Perm::Rx.is_user());
+        assert!(!Perm::Rw.is_user());
     }
 
     #[test]
@@ -240,11 +279,15 @@ mod tests {
     }
 
     #[test]
-    fn make_intermediate_tem_write_e_sem_nx() {
+    fn make_intermediate_tem_write_user_e_sem_nx() {
         let pte = make_intermediate_pte(0x400_000);
         assert_ne!(pte & PTE_PRESENT, 0);
         assert_ne!(pte & PTE_WRITABLE, 0);
-        // Intermediarias nao devem marcar NX (controle final esta no PT-folha).
+        // PTE_USER em intermediarias: necessario para walks de ring 3
+        // alcancarem folhas user. Folhas kernel ainda bloqueiam por
+        // PTE_USER=0 propria (Intel SDM 4.6.1).
+        assert_ne!(pte & PTE_USER, 0);
+        // Intermediarias nao devem marcar NX (controle final na folha).
         assert_eq!(pte & PTE_NO_EXECUTE, 0);
     }
 
