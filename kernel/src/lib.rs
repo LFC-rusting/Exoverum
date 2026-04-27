@@ -26,17 +26,9 @@ pub mod mm;
 // `cap` e pure safe Rust (#![forbid(unsafe_code)]). Host-testavel.
 pub mod cap;
 
-// `thread`: estruturas (ThreadContext, Thread, Handle) compilam em host
-// para testar invariantes de layout via `offset_of!`. As funcoes unsafe
-// (spawn, yield_to) ficam cfg-gated em target_os="none".
-pub mod thread;
-
-// `event` (Fase 6a): FSM pura host-testavel; API bare-metal (`create`,
-// `signal`, `wait`) cfg-gated em target_os="none".
-pub mod event;
-
-// `domain` (Phase 7a.4-7a.6): dominios ring 3 com CSpace propria e
-// CR3 proprio. Bare-metal-only (depende de mm::init_paging e arch).
+// `domain` (Phase 7a + 7b): dominios ring 3 com CSpace propria,
+// CR3 proprio, upcalls, PCT, cap_grant. Bare-metal-only (depende
+// de mm::init_paging e arch).
 #[cfg(target_os = "none")]
 pub mod domain;
 
