@@ -58,16 +58,59 @@ struct IdtPtr {
     base: u64,
 }
 
-/// Handler unico de excecao desta fase. Nao retorna: loga e halta.
-///
-/// `extern "C"` aceitavel porque a funcao e `-> !` (nao retornara, nao
-/// precisa de prologo/epilogo compativel com IRET). Nao confio no estado
-/// de registradores nem no alinhamento de RSP; por isso evito chamadas que
-/// exijam SSE — ja desabilitado via rustflags (`-sse,+soft-float`).
+/// (Phase 8) Dispatcher comum de exception. Recebe ctx canonico
+/// (`UserContext`) — para vetores com error code, o trampolim ja
+/// descartou o errcode com `add rsp, 8`. Decide por CPL:
+///   - **CPL=0**: kernel faltou; loga e halta (security > liveness).
+///   - **CPL=3**: dominio user faltou; chama `domain::abort_current`
+///     que marca aborted e zera CURRENT, depois halta (futuro:
+///     escolher proxima LibOS pronta).
 #[no_mangle]
-extern "C" fn exception_entry() -> ! {
-    crate::log::write_str("[kernel] EXCEPTION - halt\n");
+extern "sysv64" fn fault_dispatch(ctx: *mut super::userland::UserContext) -> ! {
+    // SAFETY: ctx aponta para UserContext valido na stack do handler.
+    let ctx_ref = unsafe { &*ctx };
+    let cpl = ctx_ref.cs & 3;
+    if cpl == 3 {
+        crate::domain::abort_current(crate::domain::UpcallReason::Fault);
+        crate::log::write_str("[kernel] ring-3 fault; halting\n");
+    } else {
+        crate::log::write_str("[kernel] EXCEPTION ring-0 - halt\n");
+    }
     super::cpu::halt_forever();
+}
+
+/// Trampolim para vetores SEM error code. Salva 15 GPRs e chama
+/// `fault_dispatch` com `*UserContext`.
+#[unsafe(naked)]
+unsafe extern "sysv64" fn fault_no_err_entry() {
+    core::arch::naked_asm!(
+        "push r15", "push r14", "push r13", "push r12",
+        "push r11", "push r10", "push r9",  "push r8",
+        "push rbp", "push rdi", "push rsi", "push rdx",
+        "push rcx", "push rbx", "push rax",
+        "mov rdi, rsp",
+        "call {dispatch}",
+        "ud2",
+        dispatch = sym fault_dispatch,
+    );
+}
+
+/// Trampolim para vetores COM error code (#DF, #TS, #NP, #SS, #GP,
+/// #PF, #AC, #CP). Descarta o errcode com `add rsp, 8` antes de
+/// salvar GPRs — assim o ctx fica canonico.
+#[unsafe(naked)]
+unsafe extern "sysv64" fn fault_with_err_entry() {
+    core::arch::naked_asm!(
+        "add rsp, 8",
+        "push r15", "push r14", "push r13", "push r12",
+        "push r11", "push r10", "push r9",  "push r8",
+        "push rbp", "push rdi", "push rsi", "push rdx",
+        "push rcx", "push rbx", "push rax",
+        "mov rdi, rsp",
+        "call {dispatch}",
+        "ud2",
+        dispatch = sym fault_dispatch,
+    );
 }
 
 /// Contador global de ticks do LAPIC timer. Incrementa em cada IRQ 0x40.
@@ -90,10 +133,14 @@ pub const fn timer_reload() -> u32 { TIMER_RELOAD_COUNT }
 pub fn init() {
     // Cast via *const () para satisfazer lint `function_casts_as_integer`
     // (Rust 2024). Conversao bit-exata para endereco do handler.
-    let handler = exception_entry as *const () as usize as u64;
+    let h_no_err = fault_no_err_entry as *const () as usize as u64;
+    let h_with_err = fault_with_err_entry as *const () as usize as u64;
 
     // type_attr = 0x8E: P=1, DPL=0, Type=0xE (64-bit interrupt gate).
     const INTERRUPT_GATE: u8 = 0x8E;
+
+    // Vetores que empilham error code (Intel SDM Vol.3 6.13).
+    const HAS_ERR_CODE: &[usize] = &[8, 10, 11, 12, 13, 14, 17, 21];
 
     // SAFETY: init roda antes de qualquer interrupcao; unica escrita na
     // IDT. Acesso via ponteiro bruto evita criar referencia mutavel a
@@ -102,12 +149,16 @@ pub fn init() {
         let idt = core::ptr::addr_of_mut!(IDT) as *mut IdtEntry;
         let mut i = 0usize;
         while i < IDT_LEN {
-            (*idt.add(i)).set(handler, KERNEL_CS, 0, INTERRUPT_GATE);
+            (*idt.add(i)).set(h_no_err, KERNEL_CS, 0, INTERRUPT_GATE);
             i += 1;
+        }
+        // Vetores com error code usam o trampolim que descarta errcode.
+        for &v in HAS_ERR_CODE {
+            (*idt.add(v)).set(h_with_err, KERNEL_CS, 0, INTERRUPT_GATE);
         }
         // Double fault (#DF) usa IST1 para garantir stack valida mesmo se
         // a stack do kernel estiver corrompida (recomendacao Intel SDM).
-        (*idt.add(8)).set(handler, KERNEL_CS, 1, INTERRUPT_GATE);
+        (*idt.add(8)).set(h_with_err, KERNEL_CS, 1, INTERRUPT_GATE);
 
         // LAPIC timer no vector 0x40. Trampolim em `userland.rs` salva
         // UserContext inteiro para suportar upcalls ring 3 (Phase 7b).
