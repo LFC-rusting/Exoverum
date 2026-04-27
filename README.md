@@ -13,6 +13,22 @@ and documenting every exception.
 and the *protection vs. management* split; seL4 / EROS / KeyKOS for the
 capability model and CDT-based revoke.
 
+## Non-negotiable principles
+
+- **The kernel never depends on a specific LibOS.** Removing every LibOS
+  (and the in-kernel demos) still leaves a kernel that boots to halt.
+- **Multiple LibOSes coexist.** No LibOS is privileged or assumed by the
+  kernel. Anything that would only make sense given one specific LibOS
+  belongs in that LibOS, not in the kernel.
+- **No POSIX / Unix in the kernel.** No file descriptors, no `signal(2)`
+  semantics, no `pthread_*`, no `mmap`, no `fork`/`exec`. POSIX or Unix
+  applications, if needed at all, are emulated by a LibOS.
+- **Mechanism, not policy.** Schedulers, IPC protocols, filesystems,
+  page-replacement strategies, name spaces — all in user-space.
+- **Hardware exposed, not abstracted.** Physical names (frame numbers,
+  IRQ vectors, MSRs) flow through the public API; the kernel guards
+  resources via capabilities, it does not virtualize them.
+
 ## Status
 
 Hard code budget: total Rust source stays at **≤ 5k LoC**. Current footprint
@@ -73,45 +89,53 @@ management*).
   that arrives, failing to respond within a fixed deadline triggers
   fail-stop (security > liveness).
 
-- **Phase 6 — Protected Control Transfer** (in progress). The kernel does
-  not define IPC abstractions. Per Engler-1995 it provides only the
-  minimum mechanism for protected cross-domain control transfer;
-  LibOSes build RPC, message passing, shared memory, sockets and
-  condvars on top. Three primitives are reserved, delivered in three
-  sub-phases:
+- **Phase 6 — Cooperative scaffolding** (done, transient). A single-bit
+  idempotent event primitive (`signal`/`wait`) used together with the
+  cooperative threads from Phase 5a to validate the `Ready` ↔ `Waiting`
+  transition before user-mode exists. **This phase is scaffolding**:
+  Aegis (Engler-1995 §4) has neither in-kernel threads nor a separate
+  event primitive — the equivalent emerges naturally from
+  exception/interrupt upcalls plus protected control transfer. Phase 7
+  removes both `thread.rs` and `event.rs` from the kernel.
 
-  - **6a — Single-bit idempotent events** (done). Signal/wait with **no
-    payload, no queue, no priority**. A `signal` without waiter is
-    *sticky* (next `wait` consumes it instantly); a `wait` without
-    pending signal *parks* the calling thread, releasing the CPU to a
-    fallback thread chosen by the caller — the kernel never decides who
-    runs next, so no scheduling policy leaks into it. LibOSes layer
-    notifications, semaphores and condition variables on top of this
-    single bit.
-  - **6b — Mediated capability transfer between domains** (pending).
-    Preserves the derivation tree and rights attenuation across
-    address spaces; the existing global revoke already cuts the whole
-    sub-tree. Requires multiple capability spaces, which appear when
-    Phase 7 introduces user-mode.
-  - **6c — Protected control transfer** (pending, lands with Phase 7).
-    Atomic switch of protection domain (address space + capability
-    space), jumping to a previously registered entry on a pre-allocated
-    stack. Optionally donates the remaining quantum, enabling
-    sub-microsecond cross-domain calls without going through any
-    scheduler.
+- **Phase 7 — exokernel proper** (pending). **Kernel mechanisms only.**
+  Phase 7 does **not** create a LibOS, an OS personality, a runtime, or
+  any user-space library. It only adds the kernel primitives that make
+  user-space domains *possible*. Validation uses a minimal in-tree
+  ring-3 payload (a few instructions plus one syscall) as an
+  integration smoke test, not as a LibOS. Real LibOSes, if ever built,
+  live outside the kernel in their own directories and are
+  substitutable; the kernel never assumes any of them.
+
+  Two parts only:
+
+  - **7a — Domains & exposed paging.** Ring-3 isolation, multiple
+    address spaces, multiple capability spaces, page-table format
+    owned by each domain (kernel only audits each PTE against the
+    owning capabilities, enforces W^X/NX, and loads CR3). Mediated
+    capability transfer between domains preserving the derivation
+    tree.
+
+  - **7b — Upcalls & control transfer.** Exception and timer dispatch
+    delivered as upcalls to the active domain (kernel demultiplexes;
+    the domain handles). Protected control transfer (synchronous and
+    asynchronous, optionally donating the remaining quantum) as the
+    only IPC primitive. Visible revocation protocol with the
+    repossession vector. With these in place, `thread.rs` and
+    `event.rs` leave the kernel; whoever runs in ring 3 implements
+    its own threads and synchronization on top of PCT and upcalls.
+    Multiple ring-3 domains coexist; none is privileged by the kernel.
 
   The kernel guarantees only capability validation, domain isolation
-  and correct context switch. Message formats, buffering, synchronization
-  models and RPC protocols are out of scope by design.
-
-- **Phase 7 — user-mode & first LibOS** (pending). Ring-3 isolation, a
-  syscall surface over the existing capability primitives, the pieces
-  deferred from earlier phases (preemption with full context switch
-  from Phase 5b; sub-phases 6b and 6c above), and a first LibOS
-  executing on top.
+  and correct context switch. Message formats, buffering, scheduling
+  policy, file systems, processes, IPC protocols, POSIX or any other
+  high-level abstraction are out of scope by design and live entirely
+  in user-space code (whether structured as a LibOS or not).
 
 - **Phase 8 — hardening & verification** (pending). Security hardening,
-  adversarial testing, cross-VM and bare-metal validation.
+  adversarial testing, abort protocol for uncooperative ring-3 domains,
+  cross-VM and bare-metal validation. **At the end of Phase 8 the
+  exokernel is complete, with no LibOS required.**
 
 ## Layout
 
@@ -135,8 +159,8 @@ kernel/                 Bare-metal ELF binary
   src/arch/x86_64/      cpu / gdt / idt / serial (unsafe isolated)
   src/mm/               frame, paging (+ unsafe boundary in mod.rs)
   src/cap.rs            capabilities flat-table + CDT + global revoke
-  src/thread.rs         Thread Control Blocks + spawn + yield_to (Phase 5a)
-  src/event.rs          single-bit idempotent events + park/wake (Phase 6a)
+  src/thread.rs         Thread Control Blocks + spawn + yield_to (SCAFFOLDING; removed in Phase 7)
+  src/event.rs          single-bit idempotent events + park/wake (SCAFFOLDING; removed in Phase 7)
   src/arch/x86_64/context.rs  switch_context (#[unsafe(naked)] + SysV)
   src/arch/x86_64/apic.rs     LAPIC init + timer one-shot + EOI (Phase 5b)
   linker.ld             kernel layout (VMA 0xFFFFFFFF80200000, LMA 0x200000)
