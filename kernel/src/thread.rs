@@ -3,17 +3,37 @@
 //! "Thread" aqui = unidade de execucao no kernel (Thread Control Block).
 //! Nao confundir com TCB = Trusted Computing Base.
 //!
+//! # ⚠ SCAFFOLDING TRANSITORIO (a remover na Phase 7)
+//!
+//! Aegis (Engler95 §4) **nao tem threads no kernel**: expoe CPU + PCT
+//! e a LibOS implementa threads. Este modulo existe para validar
+//! `switch_context` e o protocolo de `event::wait` *antes* de termos
+//! user-mode (Phase 7), nao porque o exokernel deva conhecer threads.
+//!
+//! Plano de remocao:
+//!   1. Phase 7 entrega ring-3 + PCT + upcalls de excecao/timer.
+//!   2. A primeira LibOS implementa seu proprio executor sobre PCT.
+//!   3. Este arquivo e `event.rs` saem do kernel: ou viram crate de
+//!      runtime compartilhada (`crates/libos-base/`) reusavel por
+//!      *qualquer* LibOS, ou somem completamente se cada LibOS quiser
+//!      seu modelo proprio.
+//!
+//! Independencia da LibOS hoje:
+//!   - O kernel nao depende deste modulo para boot, paging, capabilities,
+//!     IDT, LAPIC. Se voce remover `thread.rs` e os demos, o kernel boota
+//!     ate `cpu::halt_forever`. Confirmado por inspecao de `kmain::start`.
+//!   - Multiplas LibOSes podem coexistir sem usar este modulo, contanto
+//!     que cada uma traga seu proprio runtime.
+//!   - Threads aqui nao tem semantica POSIX (sem `pthread_*`, sem signals).
+//!
 //! # Filosofia (Engler95 §3, *protection vs management*)
 //!
-//! Este modulo expoe **mecanismo puro**: criar uma thread (`spawn`),
-//! trocar contexto (`yield_to`). **Nao** ha run queue, prioridade,
-//! fairness, fila de prontos, scheduler — tudo isso vive na LibOS.
-//! O kernel sabe somente:
+//! Enquanto este scaffolding existir, ele expoe **mecanismo puro**:
+//! `spawn` e `yield_to`. **Nao** ha run queue, prioridade, fairness,
+//! scheduler — quem chama `yield_to` decide a politica. O kernel sabe
+//! somente:
 //!   - quais threads existem (tabela estatica `THREADS`);
 //!   - qual esta rodando agora (`CURRENT`).
-//!
-//! Politica de "qual roda em seguida" e responsabilidade do chamador
-//! de `yield_to`: hoje, codigo do proprio kernel; na fase 7+, LibOS.
 //!
 //! # Concorrencia
 //!
@@ -350,23 +370,29 @@ pub fn current() -> Option<ThreadHandle> {
 /// porque e ponto de entrada controlado: nenhum codigo fora de
 /// `event` deveria escrever estado arbitrario de thread.
 ///
+/// # Panics
+///
+/// `raw` fora de `[0, MAX_THREADS)` ou apontando para slot `Empty`.
+/// No-op silencioso seria catastrofico: a thread chamadora ficaria
+/// eternamente `Waiting` sem signal possivel (deadlock invisivel).
+/// `assert!` em release (regra unsafe-rust §5).
+///
 /// # Safety
 ///
-/// - `raw` deve corresponder a um slot valido (devolvido por `spawn`).
-///   Fora do range, a funcao e no-op silencioso (fail-safe).
+/// - `raw` deve corresponder a um slot vivo (devolvido por `spawn`).
 /// - Kernel single-core sem preempcao.
 #[cfg(target_os = "none")]
 pub(crate) unsafe fn set_state_by_raw(raw: u8, state: ThreadState) {
     let idx = raw as usize;
-    if idx >= MAX_THREADS {
-        return;
-    }
+    assert!(idx < MAX_THREADS, "set_state_by_raw: handle fora do range");
     // SAFETY: single-core; tabela acessada so por este modulo / `event`.
     unsafe {
         let table = &mut *THREADS.0.get();
-        if !matches!(table[idx].state, ThreadState::Empty) {
-            table[idx].state = state;
-        }
+        assert!(
+            !matches!(table[idx].state, ThreadState::Empty),
+            "set_state_by_raw: handle aponta para slot Empty"
+        );
+        table[idx].state = state;
     }
 }
 
