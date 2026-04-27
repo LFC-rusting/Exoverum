@@ -58,11 +58,16 @@ const STACK_VA_BASE: u64 = 0xFFFF_FFFF_D000_0000;
 static STACK_VA_NEXT: AtomicU64 = AtomicU64::new(STACK_VA_BASE);
 
 /// Estado de uma slot da `THREADS`.
+///
+/// `Waiting` foi introduzido na Fase 6a (eventos): thread parkeada
+/// em `event::wait` aguardando signal. Nao pode ser destino de
+/// `yield_to` (sera acordada por `event::signal` que a leva a `Ready`).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum ThreadState {
     Empty,
     Ready,
     Running,
+    Waiting,
 }
 
 /// Contexto salvo de uma thread. **CRITICO**: o layout precisa bater com
@@ -274,8 +279,15 @@ pub unsafe fn yield_to(to: ThreadHandle) -> Result<(), ThreadError> {
     let (to_state, to_ctx_ptr) = unsafe {
         let table = &mut *THREADS.0.get();
         let t = &mut table[to_idx];
-        if t.state == ThreadState::Empty {
-            return Err(ThreadError::BadHandle);
+        // `Empty` e `Waiting` nao podem ser destino: a primeira nao
+        // existe; a segunda estaria pulando para uma thread parkeada
+        // (stack valida, mas parada em `wait`, produzindo deadlock
+        // silencioso se a ressurreicao nao vier via signal).
+        match t.state {
+            ThreadState::Empty | ThreadState::Waiting => {
+                return Err(ThreadError::BadHandle);
+            }
+            ThreadState::Ready | ThreadState::Running => {}
         }
         let ptr = &mut t.ctx as *mut ThreadContext as *mut u64;
         (t.state, ptr)
@@ -295,7 +307,9 @@ pub unsafe fn yield_to(to: ThreadHandle) -> Result<(), ThreadError> {
     // Atualiza estados ANTES da troca: o novo CURRENT precisa estar
     // visivel quando a thread de destino observar `current()`.
     if let Some(prev) = current() {
-        // SAFETY: idem.
+        // SAFETY: idem. Preserva `Waiting` (a thread foi parkeada por
+        // `event::wait` antes de cedermos CPU; mudar para `Ready`
+        // permitiria outro `yield_to(prev)` passar sem signal).
         unsafe {
             let table = &mut *THREADS.0.get();
             if table[prev.index()].state == ThreadState::Running {
@@ -327,6 +341,33 @@ pub unsafe fn yield_to(to: ThreadHandle) -> Result<(), ThreadError> {
 pub fn current() -> Option<ThreadHandle> {
     let v = CURRENT.load(Ordering::Relaxed);
     if v == u8::MAX { None } else { Some(ThreadHandle(v)) }
+}
+
+/// Ajusta o estado de uma thread pelo seu valor cru de handle.
+///
+/// Usado por `event::wait` (Ready -> Waiting ao parkear) e
+/// `event::signal` (Waiting -> Ready ao acordar). Mantido `pub(crate)`
+/// porque e ponto de entrada controlado: nenhum codigo fora de
+/// `event` deveria escrever estado arbitrario de thread.
+///
+/// # Safety
+///
+/// - `raw` deve corresponder a um slot valido (devolvido por `spawn`).
+///   Fora do range, a funcao e no-op silencioso (fail-safe).
+/// - Kernel single-core sem preempcao.
+#[cfg(target_os = "none")]
+pub(crate) unsafe fn set_state_by_raw(raw: u8, state: ThreadState) {
+    let idx = raw as usize;
+    if idx >= MAX_THREADS {
+        return;
+    }
+    // SAFETY: single-core; tabela acessada so por este modulo / `event`.
+    unsafe {
+        let table = &mut *THREADS.0.get();
+        if !matches!(table[idx].state, ThreadState::Empty) {
+            table[idx].state = state;
+        }
+    }
 }
 
 // =====================================================================
