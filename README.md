@@ -16,7 +16,7 @@ capability model and CDT-based revoke.
 ## Status
 
 Hard code budget: total Rust source stays at **≤ 5k LoC**. Current footprint
-is roughly 3.3k LoC (kernel ~2.1k, bootloader ~1.1k, shared ABI crate ~80).
+is roughly 3.5k LoC (kernel ~2.3k, bootloader ~1.1k, shared ABI crate ~80).
 
 Phases below are the roadmap from boot to a usable LibOS. Each phase only
 delivers *mechanism*: schedulers, IPC protocols, filesystems and any other
@@ -73,23 +73,32 @@ management*).
   that arrives, failing to respond within a fixed deadline triggers
   fail-stop (security > liveness).
 
-- **Phase 6 — Protected Control Transfer** (pending). The kernel does
+- **Phase 6 — Protected Control Transfer** (in progress). The kernel does
   not define IPC abstractions. Per Engler-1995 it provides only the
   minimum mechanism for protected cross-domain control transfer;
   LibOSes build RPC, message passing, shared memory, sockets and
-  condvars on top. Three primitives are reserved:
+  condvars on top. Three primitives are reserved, delivered in three
+  sub-phases:
 
-  - **Protected control transfer**: atomic switch of protection domain
-    (address space + capability space), jumping to a previously
-    registered entry on a pre-allocated stack. Optionally donates the
-    remaining quantum, enabling sub-microsecond cross-domain calls
-    without going through the scheduler.
-  - **Single-bit idempotent events**: signal/wait with **no payload,
-    no queue, no priority**. LibOSes layer notifications, semaphores
-    and condvars on top.
-  - **Mediated capability transfer between domains**, preserving the
-    derivation tree and rights attenuation; the existing global revoke
-    already cuts the whole sub-tree.
+  - **6a — Single-bit idempotent events** (done). Signal/wait with **no
+    payload, no queue, no priority**. A `signal` without waiter is
+    *sticky* (next `wait` consumes it instantly); a `wait` without
+    pending signal *parks* the calling thread, releasing the CPU to a
+    fallback thread chosen by the caller — the kernel never decides who
+    runs next, so no scheduling policy leaks into it. LibOSes layer
+    notifications, semaphores and condition variables on top of this
+    single bit.
+  - **6b — Mediated capability transfer between domains** (pending).
+    Preserves the derivation tree and rights attenuation across
+    address spaces; the existing global revoke already cuts the whole
+    sub-tree. Requires multiple capability spaces, which appear when
+    Phase 7 introduces user-mode.
+  - **6c — Protected control transfer** (pending, lands with Phase 7).
+    Atomic switch of protection domain (address space + capability
+    space), jumping to a previously registered entry on a pre-allocated
+    stack. Optionally donates the remaining quantum, enabling
+    sub-microsecond cross-domain calls without going through any
+    scheduler.
 
   The kernel guarantees only capability validation, domain isolation
   and correct context switch. Message formats, buffering, synchronization
@@ -97,9 +106,9 @@ management*).
 
 - **Phase 7 — user-mode & first LibOS** (pending). Ring-3 isolation, a
   syscall surface over the existing capability primitives, the pieces
-  deferred from Phases 5b/6 (preemption with full context switch, the
-  protected control transfer primitives), and a first LibOS executing
-  on top.
+  deferred from earlier phases (preemption with full context switch
+  from Phase 5b; sub-phases 6b and 6c above), and a first LibOS
+  executing on top.
 
 - **Phase 8 — hardening & verification** (pending). Security hardening,
   adversarial testing, cross-VM and bare-metal validation.
@@ -127,6 +136,7 @@ kernel/                 Bare-metal ELF binary
   src/mm/               frame, paging (+ unsafe boundary in mod.rs)
   src/cap.rs            capabilities flat-table + CDT + global revoke
   src/thread.rs         Thread Control Blocks + spawn + yield_to (Phase 5a)
+  src/event.rs          single-bit idempotent events + park/wake (Phase 6a)
   src/arch/x86_64/context.rs  switch_context (#[unsafe(naked)] + SysV)
   src/arch/x86_64/apic.rs     LAPIC init + timer one-shot + EOI (Phase 5b)
   linker.ld             kernel layout (VMA 0xFFFFFFFF80200000, LMA 0x200000)
@@ -172,13 +182,15 @@ On `make run` the expected serial trace is:
 [kernel] timer tick
 [kernel] timer tick
 [kernel] timer demo done; 3 ticks observados
-[kernel] threads spawned; yield_to A
-[kernel] thread A1                          <-- 6 cooperative
-[kernel] thread B1                          <-- context switches
-[kernel] thread A2
-[kernel] thread B2
-[kernel] thread A3
-[kernel] thread B3; threads done
+[kernel] events demo: yield_to ev_a
+[kernel] ev_a yield_to B (setup sticky)     <-- 4 cooperative
+[kernel] ev_b signal(e1) (sticky)           <-- context switches
+[kernel] ev_a wait(e1) (sticky deve consumir)
+[kernel] ev_a consumiu e1 sticky            <-- sticky-bit consumed
+[kernel] ev_a wait(e2) (deve parkear)
+[kernel] ev_b signal(e2) (acorda A)         <-- park-then-wake
+[kernel] ev_a acordou de wait(e2)
+[kernel] events demo done
 ```
 
 ## Security rules (binding)
