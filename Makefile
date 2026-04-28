@@ -84,11 +84,14 @@ $(ESP_DIR): kernel bootloader
 
 esp: $(ESP_DIR)
 
-# Imagem FAT32 de 64 MiB. Poderiamos usar partition table GPT para ficar
-# mais fiel a UEFI, mas QEMU+OVMF aceita uma particao raw. Futuramente
-# dividimos em ESP + root se precisarmos.
+# Imagem FAT32 raw. UEFI 2.x exige FAT12/16/32 na ESP; usamos FAT32 por
+# ampla compatibilidade (firmware estrito + QEMU/VirtualBox/VMware).
+# Tamanho minimo seguro de FAT32 com mkfs.fat = ~33 MiB. Conteudo atual
+# (kernel.elf + bootloader.efi) ~84 KiB; default 33 MiB deixa folga
+# generosa sem desperdicar disco. Configuravel via `make IMG_MB=N`.
+IMG_MB ?= 33
 $(DISK_IMG): $(ESP_DIR)
-	dd if=/dev/zero of=$(DISK_IMG) bs=1M count=64 status=none
+	dd if=/dev/zero of=$(DISK_IMG) bs=1M count=$(IMG_MB) status=none
 	mkfs.fat -F 32 -n EXOVERUM $(DISK_IMG) > /dev/null
 	mcopy -i $(DISK_IMG) -s $(ESP_DIR)/EFI ::/
 
