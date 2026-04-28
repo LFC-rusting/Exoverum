@@ -3,22 +3,29 @@
 [build]
 target = "x86_64-unknown-uefi"
 
-[target.x86_64-unknown-uefi]
-# panic=abort evita unwinding no ambiente UEFI
-rustflags = ["-C", "panic=abort"]
-
 [target.x86_64-unknown-none]
-# Kernel bare-metal identity-mapped em low memory (2 MiB).
-# Uso o code model "small" (default) por rodar abaixo dos 2 GiB. Quando o
-# kernel migrar para higher-half futuramente, troco para "kernel".
-# no-redzone e indispensavel para handlers de interrupcao.
-# Desabilito SSE para nao precisar salvar estado FP ainda; MMX e soft-float
-# sao implicados (x86_64-unknown-none ja vem com soft-float padrao).
+# Kernel bare-metal higher-half. Code model "small" (default) por rodar
+# abaixo de 2 GiB de phys; ao migrar mais para cima, trocar para "kernel".
+# no-redzone e mandatorio para handlers de interrupcao.
+# target-feature=-sse evita salvar estado FP nos handlers; soft-float
+# vem por padrao em x86_64-unknown-none.
+# function-sections + data-sections + --gc-sections garantem que symbol
+# nao-referenciado nao gere bytes no binario; reduz tamanho final em
+# combinacao com lto="fat".
 rustflags = [
     "-C", "panic=abort",
     "-C", "relocation-model=static",
     "-C", "no-redzone=yes",
     "-C", "target-feature=-sse",
+    "-C", "link-arg=--gc-sections",
+]
+
+[target.x86_64-unknown-uefi]
+# Bootloader UEFI: panic=abort + gc-sections para enxugar o .efi PE final.
+rustflags = [
+    "-C", "panic=abort",
+    "-C", "link-arg=/OPT:REF",
+    "-C", "link-arg=/OPT:ICF",
 ]
 
 [alias]
