@@ -63,8 +63,8 @@ kernel that boots cleanly to halt.
 
 The exokernel is **architecturally complete**. All eight phases of
 the roadmap are merged. Hard code budget: total Rust source stays
-at **≤ 4.5k LoC**. Current footprint is **4.15k LoC** (kernel
-~2.9k, bootloader ~1.2k, shared ABI crate ~80). Host test suite:
+at **≤ 4.5k LoC**. Current footprint is **4.0k LoC** (kernel
+~2.9k, bootloader ~1.1k, shared ABI crate ~60). Host test suite:
 **49 tests, all passing**.
 
 Phases below summarize what each milestone delivered. Every phase
