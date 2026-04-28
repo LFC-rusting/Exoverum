@@ -35,7 +35,7 @@ pub unsafe fn start(bootinfo: *const BootInfo) -> ! {
     log::write_str("[kernel] hello\n");
 
     if bootinfo.is_null() {
-        log::write_str("[kernel] bootinfo nulo\n");
+        log::write_str("[kernel] null bootinfo\n");
         cpu::halt_forever();
     }
 
@@ -66,11 +66,11 @@ pub unsafe fn start(bootinfo: *const BootInfo) -> ! {
             demo_alloc_free();
         }
         Err(mm::FrameError::InvalidDescriptorSize) => {
-            log::write_str("[kernel] mm::init err: desc_size invalido\n");
+            log::write_str("[kernel] mm::init err: invalid desc_size\n");
             cpu::halt_forever();
         }
         Err(mm::FrameError::InvalidMemoryMap) => {
-            log::write_str("[kernel] mm::init err: memory map invalida\n");
+            log::write_str("[kernel] mm::init err: invalid memory map\n");
             cpu::halt_forever();
         }
     }
@@ -84,16 +84,16 @@ pub unsafe fn start(bootinfo: *const BootInfo) -> ! {
     // SAFETY: `mm::init` completou; dados do bootinfo ja foram consumidos.
     match unsafe { mm::init_paging() } {
         Ok(pml4) => {
-            log::write_str("[kernel] paging ativo; cr3=0x");
+            log::write_str("[kernel] paging active; cr3=0x");
             log_u64_hex(pml4);
             log::write_str("\n");
         }
         Err(mm::PagingError::OutOfFrames) => {
-            log::write_str("[kernel] paging err: sem frames\n");
+            log::write_str("[kernel] paging err: out of frames\n");
             cpu::halt_forever();
         }
         Err(mm::PagingError::InternalConflict) => {
-            log::write_str("[kernel] paging err: colisao interna\n");
+            log::write_str("[kernel] paging err: internal collision\n");
             cpu::halt_forever();
         }
     }
@@ -125,10 +125,10 @@ fn demo_timer() {
     // SAFETY: pos-init_paging; idt ja contem timer_handler_entry; chamada
     // unica por boot.
     if let Err(_) = unsafe { apic::init() } {
-        log::write_str("[kernel] apic init falhou\n");
+        log::write_str("[kernel] apic init failed\n");
         return;
     }
-    log::write_str("[kernel] apic ok; armando timer\n");
+    log::write_str("[kernel] apic ok; arming timer\n");
     // SAFETY: apic::init bem-sucedido garante MMIO mapeado.
     unsafe { apic::arm_oneshot(idt::timer_reload()); }
     cpu::sti();
@@ -137,7 +137,7 @@ fn demo_timer() {
         cpu::hlt();
     }
     cpu::cli();
-    log::write_str("[kernel] timer demo done; 3 ticks observados\n");
+    log::write_str("[kernel] timer demo done; 3 ticks observed\n");
 }
 
 /// Phases 7a/7b/8 smoke test: dois dominios em ring 3 exercitam o
@@ -337,7 +337,7 @@ fn demo_caps() {
         free_index: 0,
     };
     if table.insert_root(0, root, CapRights::ALL).is_err() {
-        log::write_str("[kernel] cap err: insert_root\n");
+        log::write_str("[kernel] cap err: insert_root failed\n");
         return;
     }
     // Duas subregioes derivadas + uma copia atenuada do primeiro child.
@@ -348,14 +348,14 @@ fn demo_caps() {
         || table.retype_untyped(0, 2, 0x4_0000).is_err()
         || table.copy(1, 3, CapRights::READ).is_err()
     {
-        log::write_str("[kernel] cap err: derivacao\n");
+        log::write_str("[kernel] cap err: derivation failed\n");
         return;
     }
-    log::write_str("[kernel] cap root + 3 descendentes criados\n");
+    log::write_str("[kernel] cap root + 3 descendants created\n");
 
     // Revoke global: apaga TODOS os descendentes da raiz.
     if table.revoke(0).is_err() {
-        log::write_str("[kernel] cap err: revoke\n");
+        log::write_str("[kernel] cap err: revoke failed\n");
         return;
     }
     // Raiz sobrevive; slots 1..3 ficam vazios.
@@ -365,9 +365,9 @@ fn demo_caps() {
         .iter()
         .all(|&s| table.lookup(s) == Err(CapError::SlotEmpty));
     if root_ok && descendentes_limpos {
-        log::write_str("[kernel] revoke global ok; raiz intacta\n");
+        log::write_str("[kernel] global revoke ok; root intact\n");
     } else {
-        log::write_str("[kernel] revoke global INCOERENTE\n");
+        log::write_str("[kernel] global revoke INCOHERENT\n");
     }
 }
 
@@ -384,7 +384,7 @@ fn demo_physmap() {
     let frame = match mm::alloc_frame() {
         Some(f) => f,
         None => {
-            log::write_str("[kernel] physmap err: sem frames\n");
+            log::write_str("[kernel] physmap err: out of frames\n");
             return;
         }
     };
@@ -393,7 +393,7 @@ fn demo_physmap() {
     // DEMO_VA termina em zeros).
     let r = unsafe { mm::map_kernel_page(DEMO_VA, frame.addr(), mm::Perm::Rw) };
     if r.is_err() {
-        log::write_str("[kernel] physmap err: map_kernel_page\n");
+        log::write_str("[kernel] physmap err: map_kernel_page failed\n");
         return;
     }
     // SAFETY: a pagina acabou de ser mapeada RW+NX na VA DEMO_VA; escrita
@@ -405,18 +405,18 @@ fn demo_physmap() {
         let p_via_physmap = mm::phys_to_virt(frame.addr());
         let v = p_via_physmap.read_volatile();
         if v == PATTERN {
-            log::write_str("[kernel] physmap ok: map+physmap view coerentes\n");
+            log::write_str("[kernel] physmap ok: map+physmap views coherent\n");
         } else {
-            log::write_str("[kernel] physmap INCOERENTE\n");
+            log::write_str("[kernel] physmap INCOHERENT\n");
         }
     }
 }
 
-/// Imprime "[kernel] frames livres: N de T" no log serial.
+/// Imprime "[kernel] free frames: N of T" no log serial.
 fn log_frame_stats() {
-    log::write_str("[kernel] frames livres: ");
+    log::write_str("[kernel] free frames: ");
     log_usize(mm::free_count());
-    log::write_str(" de ");
+    log::write_str(" of ");
     log_usize(mm::total_frames());
     log::write_str("\n");
 }
@@ -429,11 +429,11 @@ fn demo_alloc_free() {
             log_u64_hex(frame.addr());
             log::write_str("\n");
             mm::free_frame(frame);
-            log::write_str("[kernel] frame devolvido; livres: ");
+            log::write_str("[kernel] frame freed; free: ");
             log_usize(mm::free_count());
             log::write_str("\n");
         }
-        None => log::write_str("[kernel] sem frames livres!\n"),
+        None => log::write_str("[kernel] no free frames!\n"),
     }
 }
 
