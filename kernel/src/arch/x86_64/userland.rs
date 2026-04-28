@@ -330,7 +330,7 @@ extern "sysv64" fn syscall_dispatch(ctx: *mut UserContext) {
             }
         }
         _ => {
-            log::write_str("[kernel] syscall desconhecida; halt\n");
+            log::write_str("[kernel] unknown syscall; halt\n");
             cpu::halt_forever();
         }
     }
