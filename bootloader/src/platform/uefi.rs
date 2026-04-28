@@ -737,39 +737,39 @@ pub extern "efiapi" fn efi_entry(image: EfiHandle, system_table: *mut EfiSystemT
     serial::write_str("[boot] efi_entry\n");
 
     if system_table.is_null() {
-        bail("[boot] erro: system_table nulo\n");
+        bail("[boot] error: null system_table\n");
     }
     // SAFETY: verificado não-nulo acima; o firmware garante ponteiro válido.
     let st = unsafe { &*system_table };
     let bs = match NonNull::new(st.boot_services as *mut EfiBootServices) {
         Some(b) => b,
-        None => bail("[boot] erro: boot_services nulo\n"),
+        None => bail("[boot] error: null boot_services\n"),
     };
 
-    serial::write_str("[boot] carregando kernel.elf\n");
+    serial::write_str("[boot] loading kernel.elf\n");
     let kernel = match load_kernel_real(bs, image, &KERNEL_PATH_UTF16) {
         Ok(k) => k,
-        Err(_) => bail("[boot] erro: kernel.elf nao encontrado\n"),
+        Err(_) => bail("[boot] error: kernel.elf not found\n"),
     };
 
-    serial::write_str("[boot] validando ELF\n");
+    serial::write_str("[boot] validating ELF\n");
     let img = KernelImage { elf: kernel, expected_sha256: None };
     if process_kernel_image(&img).is_err() {
-        bail("[boot] erro: ELF invalido ou hash invalido\n");
+        bail("[boot] error: invalid ELF or hash mismatch\n");
     }
 
     let kernel_phys = match kernel_phys_range_from_elf(kernel) {
         Ok(r) => r,
-        Err(_) => bail("[boot] erro: faixa fisica do kernel invalida\n"),
+        Err(_) => bail("[boot] error: invalid kernel physical range\n"),
     };
 
     // Copia os segmentos PT_LOAD para seus enderecos fisicos reais via
     // AllocatePages(AllocateAddress). Necessario porque `load_kernel_real`
     // deposita o ELF em pool arbitraria; o kernel precisa estar em `p_paddr`.
-    serial::write_str("[boot] copiando PT_LOAD para enderecos fisicos\n");
+    serial::write_str("[boot] copying PT_LOAD to physical addresses\n");
     let _kernel_entry = match load_elf_segments_real(bs, kernel) {
         Ok(e) => e,
-        Err(_) => bail("[boot] erro: falha ao carregar PT_LOAD em paddr\n"),
+        Err(_) => bail("[boot] error: failed to copy PT_LOAD to paddr\n"),
     };
 
     // Mensagem de ok no console EFI ANTES de GetMemoryMap: output_string
@@ -836,13 +836,13 @@ pub extern "efiapi" fn efi_entry(image: EfiHandle, system_table: *mut EfiSystemT
     // SAFETY: chamada UEFI terminal; `map_key` foi obtido na última GetMemoryMap.
     let status = unsafe { (bs.as_ref().exit_boot_services)(image, map_key) };
     if !status_success(status) {
-        bail("[boot] erro: ExitBootServices falhou\n");
+        bail("[boot] error: ExitBootServices failed\n");
     }
-    serial::write_str("[boot] salto para o kernel\n");
+    serial::write_str("[boot] jumping to kernel\n");
 
     let entry = match kernel_entry_from_elf(kernel) {
         Ok(e) => e as usize,
-        Err(_) => bail("[boot] erro: entry invalido\n"),
+        Err(_) => bail("[boot] error: invalid entry\n"),
     };
     // SAFETY: `entry` veio do ELF ja validado (W^X, dentro de LOAD executavel).
     // ABI `sysv64` explicita: em target UEFI `extern "C"` == Windows x64 (RCX),
