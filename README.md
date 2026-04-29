@@ -5,8 +5,14 @@ minimal Trusted Computer Base (TCB), and a capability model inspired by seL4, ER
 The kernel exports **mechanism, not policy** (Engler, Kaashoek, O'Toole 1995):
 physical resources and protection primitives only; every abstraction —
 allocators, schedulers, IPC protocols, filesystems — lives in user-space
-LibOSes. The goal is an academic Exokernel offering an guide for anyone to write
-it from scratch through rigorous documentation.
+LibOSes.
+
+The goal is to develop an academic **exokernel** that serves as a well-documented reference
+for building such systems from scratch. While **monolithic**, **hybrid**, and **microkernel**
+architectures are supported by numerous modern, open-source implementations with extensive
+educational material, there is a clear lack of contemporary, fully open, and pedagogically
+structured **exokernel** projects. This gap significantly limits the practical study, reproducibility,
+and dissemination of **exokernel** design principles.
 
 **Reference sources**: Engler-1995 (MIT Aegis / ExOS) for exokernel philosophy
 and the *protection vs. management* split; seL4, EROS, and KeyKOS for the
