@@ -1,16 +1,15 @@
 # Exoverum
 
-Exokernel written in Rust for x86_64. Uncompromising focus on security, a
-minimal TCB, and a capability model inspired by seL4 / EROS / KeyKOS. The
-kernel exports **mechanism, not policy** (Engler, Kaashoek, O'Toole 1995):
+Exokernel written in Rust for x86_64 UEFI. Uncompromising focus on security, a
+minimal Trusted Computer Base (TCB), and a capability model inspired by seL4, EROS, and KeyKOS.
+The kernel exports **mechanism, not policy** (Engler, Kaashoek, O'Toole 1995):
 physical resources and protection primitives only; every abstraction —
 allocators, schedulers, IPC protocols, filesystems — lives in user-space
-LibOSes. The goal is an academic OS offering isolated LibOSes on top of an
-extremely lean core, prioritizing `#![forbid(unsafe_code)]` whenever possible
-and documenting every exception.
+LibOSes. The goal is an academic Exokernel offering an guide for anyone to write
+it from scratch through rigorous documentation.
 
 **Reference sources**: Engler-1995 (MIT Aegis / ExOS) for exokernel philosophy
-and the *protection vs. management* split; seL4 / EROS / KeyKOS for the
+and the *protection vs. management* split; seL4, EROS, and KeyKOS for the
 capability model and CDT-based revoke.
 
 ## Non-negotiable principles
@@ -23,7 +22,7 @@ capability model and CDT-based revoke.
 - **No POSIX / Unix in the kernel.** No file descriptors, no `signal(2)`
   semantics, no `pthread_*`, no `mmap`, no `fork`/`exec`. POSIX or Unix
   applications, if needed at all, are emulated by a LibOS.
-- **Mechanism, not policy.** Schedulers, IPC protocols, filesystems,
+- **Mechanism only, not policy.** Schedulers, IPC protocols, filesystems,
   page-replacement strategies, name spaces — all in user-space.
 - **Hardware exposed, not abstracted.** Physical names (frame numbers,
   IRQ vectors, MSRs) flow through the public API; the kernel guards
@@ -54,21 +53,23 @@ the monotonic rights attenuation invariant. Mutual-trust sharing
 works today; UDFs, wakeup predicates and software regions are
 *policy* and live in the LibOS.
 
-The kernel never depends on a particular LibOS, never assumes a
-UNIX or POSIX semantics, never reaches into user-space data
-structures. Removing every demo from `kmain.rs` still leaves a
-kernel that boots cleanly to halt.
-
 ## Status
 
 The exokernel is **architecturally complete**. All eight phases of
 the roadmap are merged. Hard code budget: total Rust source stays
-at **≤ 4.5k LoC**. Current footprint is **4.0k LoC** (kernel
-~2.9k, bootloader ~1.1k, shared ABI crate ~60). Host test suite:
+at **≤ 4.5k Lines of Code**. Current footprint is:
+
+| Artifact | LoC |
+|---|---|
+| Bootloader | ~1.1k LoC |
+| Kernel | ~2.9k LoC |
+| Crates | ~0.6k LoC |
+
+Host test suite:
 **49 tests, all passing**.
 
 Phases below summarize what each milestone delivered. Every phase
-delivers only *mechanism*: schedulers, IPC protocols, file systems
+delivers only *mechanism*; schedulers, IPC protocols, file systems
 and any other abstraction live in user-space LibOSes (Engler–1995
 §3 — *protection vs. management*).
 
@@ -396,11 +397,6 @@ The two binaries together are about **82 KiB**; the disk image is
 to format anything smaller. Override with `make IMG_MB=N` if you
 need a bigger ESP for future LibOSes; the binaries don't grow.
 
-**The build produces the binaries; the binaries do not need any
-existing `.elf`.** A clean checkout (`make clean && make`) builds
-everything from source. The kernel ELF is the *output* of
-`cargo build -p kernel`, never an input.
-
 ## Portability across virtual machines and bare metal
 
 `target/exoverum.img` is a raw, byte-for-byte UEFI-bootable disk.
@@ -449,15 +445,14 @@ exits, and the kernel halts. Every privilege boundary, every
 capability check and every state machine touched by the protocol
 is covered by this single ~25-line demo.
 
-## Security rules (binding)
+## Security rules
 
 - No external crates. Every dependency enlarges the TCB.
+- Minimal lines of code. Every line of code is a potential vulnerability.
 - `unsafe` minimal, isolated in dedicated modules, each block documented with
   a `SAFETY:` comment stating the invariant. High-level modules declare
   `#![forbid(unsafe_code)]`.
 - ABI boundary types use `#[repr(C)]` (see `crates/bootinfo`).
-- Hardened release profile: `opt-level="z"`, `lto="fat"`, `codegen-units=1`,
-  `panic="abort"`, `strip=symbols`, `overflow-checks=true`.
 - Linker: `--gc-sections` for the kernel (LLD) and `/OPT:REF /OPT:ICF`
   for the bootloader (LLD-link) to drop unreferenced code without
   weakening any check.
@@ -466,4 +461,4 @@ is covered by this single ~25-line demo.
 
 ## License
 
-[The Unlicense](https://unlicense.org/).
+[The Unlicense](https://unlicense.org/)
