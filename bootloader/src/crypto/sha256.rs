@@ -32,7 +32,9 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     // Processo blocos cheios e depois SEMPRE rodo o padding final — mesmo
     // quando `data` é vazio ou múltiplo exato de 64, o último bloco padded
     // deve ser comprimido (requisito FIPS 180-4).
-    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let bit_len = (data.len() as u64)
+        .checked_mul(8)
+        .expect("Input data too long: maximum 2^61 - 1 bytes (2^64 - 1 bits)");
     let mut buffer = [0u8; 64];
     let mut h = H0;
 
