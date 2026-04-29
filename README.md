@@ -8,7 +8,7 @@ allocators, schedulers, IPC protocols, filesystems — lives in user-space
 LibOSes.
 
 The goal is to develop an academic **exokernel** that serves as a well-documented reference
-for building such systems from scratch. While **monolithic**, **hybrid**, and **microkernel**
+for building such systems from scratch. While **monolithic** and **microkernel**
 architectures are supported by numerous modern, open-source implementations with extensive
 educational material, there is a clear lack of contemporary, fully open, and pedagogically
 structured **exokernel** projects. This gap significantly limits the practical study, reproducibility,
