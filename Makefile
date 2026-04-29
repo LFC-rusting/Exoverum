@@ -70,8 +70,9 @@ help:
 kernel:
 	cargo build $(CARGO_FLAGS) -p kernel --target x86_64-unknown-none
 
-bootloader:
-	cargo build $(CARGO_FLAGS) -p bootloader
+bootloader: kernel
+	EXOVERUM_KERNEL_SHA256=$$(sha256sum $(KERNEL_ELF) | awk '{print $$1}') \
+		cargo build $(CARGO_FLAGS) -p bootloader
 
 # ESP: arvore de arquivos que sera copiada para dentro do FAT32. Usamos o
 # nome canonico `BOOTX64.EFI` em `/EFI/BOOT/` para o firmware encontrar
