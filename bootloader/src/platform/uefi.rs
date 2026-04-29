@@ -12,6 +12,7 @@ use core::slice;
 
 use crate::{
     build_bootinfo,
+    embedded_kernel_sha256,
     elf::{kernel_entry_from_elf, kernel_phys_range_from_elf, parse_elf_header, parse_ph, PT_LOAD},
     platform::serial,
     process_kernel_image,
@@ -753,7 +754,11 @@ pub extern "efiapi" fn efi_entry(image: EfiHandle, system_table: *mut EfiSystemT
     };
 
     serial::write_str("[boot] validating ELF\n");
-    let img = KernelImage { elf: kernel, expected_sha256: None };
+    let expected_sha256 = match embedded_kernel_sha256() {
+        Ok(h) => h,
+        Err(_) => bail("[boot] error: embedded hash invalid\n"),
+    };
+    let img = KernelImage { elf: kernel, expected_sha256 };
     if process_kernel_image(&img).is_err() {
         bail("[boot] error: invalid ELF or hash mismatch\n");
     }
