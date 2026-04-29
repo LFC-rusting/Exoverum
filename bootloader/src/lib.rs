@@ -46,10 +46,10 @@ pub enum BootError {
     PageTableUnavailable,
 }
 
-/// Imagem do kernel em memória, com hash opcional para verificação.
+/// Imagem do kernel em memória, com hash esperado obrigatório.
 pub struct KernelImage<'a> {
     pub elf: &'a [u8],
-    pub expected_sha256: Option<[u8; 32]>,
+    pub expected_sha256: [u8; 32],
 }
 
 /// Informações coletadas da plataforma antes do ExitBootServices.
@@ -61,12 +61,45 @@ pub struct PlatformInfo {
     pub kernel_phys_range: PhysRange,
 }
 
-/// Verifica SHA-256 do ELF se um hash esperado foi embutido na imagem.
-pub fn verify_sha256(elf: &[u8], expected: Option<[u8; 32]>) -> Result<(), BootError> {
-    if let Some(hash) = expected {
-        if crypto::sha256::sha256(elf) != hash {
-            return Err(BootError::HashMismatch);
-        }
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn parse_sha256_hex(hex: &str) -> Result<[u8; 32], BootError> {
+    let bytes = hex.as_bytes();
+    if bytes.len() != 64 {
+        return Err(BootError::HashMismatch);
+    }
+    let mut out = [0u8; 32];
+    let mut i = 0usize;
+    while i < 32 {
+        let hi = hex_nibble(bytes[i * 2]).ok_or(BootError::HashMismatch)?;
+        let lo = hex_nibble(bytes[i * 2 + 1]).ok_or(BootError::HashMismatch)?;
+        out[i] = (hi << 4) | lo;
+        i += 1;
+    }
+    Ok(out)
+}
+
+/// Hash SHA-256 do `kernel.elf` embutido no build do bootloader.
+///
+/// Preenchido em tempo de compilação via variável de ambiente
+/// `EXOVERUM_KERNEL_SHA256` (hex com 64 caracteres).
+pub fn embedded_kernel_sha256() -> Result<[u8; 32], BootError> {
+    let hex = option_env!("EXOVERUM_KERNEL_SHA256")
+        .ok_or(BootError::HashMismatch)?;
+    parse_sha256_hex(hex)
+}
+
+/// Verifica SHA-256 do ELF contra hash esperado obrigatório.
+pub fn verify_sha256(elf: &[u8], expected: [u8; 32]) -> Result<(), BootError> {
+    if crypto::sha256::sha256(elf) != expected {
+        return Err(BootError::HashMismatch);
     }
     Ok(())
 }
