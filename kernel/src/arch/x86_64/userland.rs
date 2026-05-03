@@ -1,18 +1,15 @@
-//! Phase 7a + 7b: entrada/saida de ring 3, syscall dispatch, upcalls.
+//! Entrada/saida de ring 3 e syscall dispatch.
 //!
 //! # Trafego ring 3 <-> kernel
 //!
 //! - **Entrada inicial:** `enter_ring3` faz `iretq` sintetico (kernel
-//!   nunca vai voltar; quem volta e o handler de INT 0x80 ou de timer).
+//!   nao volta daqui; quem retorna ao kernel e o handler de INT 0x80
+//!   ou o dispatcher de excecao).
 //! - **Syscall:** `INT 0x80`, gate DPL=3, trampolim `syscall_entry`
 //!   salva `UserContext` completo na stack RSP0 e chama
 //!   `syscall_dispatch`. O dispatcher pode modificar o `UserContext`
 //!   in-place (PCT troca de dominio), e o `iretq` final carrega o
 //!   estado modificado.
-//! - **Timer:** `timer_handler_entry` ja existia em `idt.rs` para o
-//!   caminho ring 0. Phase 7b adiciona o caminho ring 3 — quando o
-//!   timer interrompe ring 3, o handler entrega o controle ao
-//!   `upcall_entry` do dominio ativo.
 //!
 //! # `UserContext` na stack RSP0
 //!
@@ -22,8 +19,8 @@
 //! sobrescreve o bloco com o ctx de outro dominio (PCT), o `iretq`
 //! seguinte carrega o novo ring 3.
 //!
-//! SYSCALL/SYSRET fica como otimizacao opcional; o INT path e mais
-//! simples e ja exercita o caminho de excecao reusado pelos upcalls.
+//! Exokernel: kernel nao programa timer, nao entrega upcalls, nao
+//! preempta. LibOS roda ate fazer syscall voluntaria ou falhar.
 
 #![cfg(target_os = "none")]
 
@@ -39,12 +36,13 @@ use crate::log;
 // =================================================================
 
 /// Snapshot completo do estado ring 3 quando o kernel toma controle
-/// (via INT 0x80 ou timer interrompendo ring 3).
+/// via INT 0x80 ou excecao.
 ///
-/// Layout casa **exatamente** com a ordem em que `syscall_entry` /
-/// `timer_handler_user_entry` pushed os registradores na stack RSP0.
-/// Os 5 ultimos campos (`rip`..`ss`) sao escritos pela CPU automaticamente
-/// no `iret frame` quando ela aceita a interrupcao DPL=3.
+/// Layout casa **exatamente** com a ordem em que `syscall_entry`
+/// (ou os trampolins de fault em `idt.rs`) empilham os registradores
+/// na stack RSP0. Os 5 ultimos campos (`rip`..`ss`) sao escritos pela
+/// CPU automaticamente no `iret frame` quando ela aceita a interrupcao
+/// DPL=3.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct UserContext {
@@ -83,8 +81,9 @@ impl UserContext {
             r12: 0, r13: 0, r14: 0, r15: 0,
             rip,
             cs: USER_CS as u64,
-            // RFLAGS bit 1 reservado=1, IF=1 (bit 9): timer pode upcall.
-            rflags: 0x202,
+            // RFLAGS bit 1 reservado=1, IF=0 (kernel nao configura
+            // nenhuma fonte de interrupcao hardware).
+            rflags: 0x002,
             rsp,
             ss: USER_DS as u64,
         }
@@ -188,18 +187,6 @@ __userland_payload_b_start:
     int 0x80
     ud2
 __userland_payload_b_end:
-
-    // Phase 8: handler de upcall trivial. Faz syscall=4 (upcall_return),
-    // que retorna ao ctx pre-upcall (entry normal do dominio).
-    .section .rodata.userland_upcall_handler, "a"
-    .globl __userland_upcall_handler_start
-    .globl __userland_upcall_handler_end
-    .balign 16
-__userland_upcall_handler_start:
-    mov rax, 4
-    int 0x80
-    ud2
-__userland_upcall_handler_end:
     "#
 );
 
@@ -209,8 +196,6 @@ extern "C" {
     static __userland_payload_a_target_offset: u64;
     static __userland_payload_b_start: u8;
     static __userland_payload_b_end: u8;
-    static __userland_upcall_handler_start: u8;
-    static __userland_upcall_handler_end: u8;
 }
 
 /// Bytes do payload do dominio A (cliente PCT). O caller deve
@@ -249,17 +234,6 @@ pub fn payload_b_bytes() -> &'static [u8] {
     }
 }
 
-/// (Phase 8) Bytes do handler de upcall trivial.
-pub fn upcall_handler_bytes() -> &'static [u8] {
-    let start = core::ptr::addr_of!(__userland_upcall_handler_start);
-    let end = core::ptr::addr_of!(__userland_upcall_handler_end);
-    // SAFETY: idem.
-    unsafe {
-        let len = (end as usize) - (start as usize);
-        core::slice::from_raw_parts(start, len)
-    }
-}
-
 // =================================================================
 // Stack RSP0 dedicada para INT vinda de ring 3
 // =================================================================
@@ -285,7 +259,6 @@ fn syscall_stack_top() -> u64 {
 ///   - 1  `exit`           -> halta (nao retorna)
 ///   - 2  `domain_call(t)` -> PCT sync; muda ctx para o dominio `t`
 ///   - 3  `domain_reply(v)`-> PCT sync; muda ctx para o caller
-///   - 4  `upcall_return`  -> restaura ctx pre-upcall salvo
 extern "sysv64" fn syscall_dispatch(ctx: *mut UserContext) {
     // SAFETY: `ctx` aponta para UserContext na SYSCALL_STACK,
     // construido pelo trampolim. Single-core; nao ha alias.
@@ -318,14 +291,6 @@ extern "sysv64" fn syscall_dispatch(ctx: *mut UserContext) {
             if let Err(e) = unsafe { domain::pct_reply(ctx, value) } {
                 log::write_str("[kernel] pct_reply err\n");
                 let _ = e;
-                ctx_ref.rax = u64::MAX;
-            }
-        }
-        4 => {
-            // upcall_return: restaura ctx pre-upcall.
-            // SAFETY: idem.
-            if let Err(_) = unsafe { domain::upcall_return(ctx) } {
-                log::write_str("[kernel] upcall_return err\n");
                 ctx_ref.rax = u64::MAX;
             }
         }
@@ -375,69 +340,6 @@ pub fn syscall_handler_addr() -> u64 {
 }
 
 // =================================================================
-// Timer handler com upcall ring 3
-// =================================================================
-
-/// Corpo Rust do timer. Recebe ptr para UserContext (15 GPRs + iret
-/// frame). Decide entre:
-///   - **CPL=0** (interrompeu kernel): log + EOI + rearm; nao toca ctx.
-///   - **CPL=3** (interrompeu ring 3): se o dominio ativo registrou
-///     upcall, sobrescreve ctx para entrar em `upcall_entry`. Senao,
-///     comportamento idem ao CPL=0 (apenas EOI+rearm; ring 3 retoma).
-///
-/// O bit CPL fica em `cs & 3` no iret frame.
-#[no_mangle]
-extern "sysv64" fn timer_handler_rust(ctx: *mut UserContext) {
-    use core::sync::atomic::Ordering;
-    crate::arch::x86_64::idt::TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
-
-    // SAFETY: ctx valido na syscall stack.
-    let ctx_ref = unsafe { &mut *ctx };
-    let cpl = ctx_ref.cs & 3;
-
-    if cpl == 3 {
-        // Interrompeu ring 3. Tenta entregar upcall.
-        // SAFETY: ctx em SYSCALL_STACK; pct_timer_upcall consulta
-        // CURRENT_DOMAIN e modifica *ctx in-place se houver upcall.
-        unsafe { domain::timer_upcall(ctx) };
-    } else {
-        log::write_str("[kernel] timer tick\n");
-    }
-
-    // SAFETY: handler so executa apos apic::init; EOI valido em ISR.
-    unsafe {
-        crate::arch::x86_64::apic::eoi();
-        crate::arch::x86_64::apic::arm_oneshot(crate::arch::x86_64::idt::timer_reload());
-    }
-}
-
-/// Trampolim do IRQ 0x40 com save/restore completo. Mesmo formato
-/// que `syscall_entry`: empilha UserContext na stack atual.
-///
-/// Quando IRQ vem de CPL=0, a CPU NAO troca para RSP0 — usa a stack
-/// atual do kernel. Mesmo assim, push de 15 GPRs cria UserContext
-/// valido (rip/cs/rflags/rsp/ss vem do iret frame).
-///
-/// Quando IRQ vem de CPL=3, CPU troca para RSP0 (TSS).
-#[unsafe(naked)]
-pub unsafe extern "sysv64" fn timer_handler_entry() {
-    core::arch::naked_asm!(
-        "push r15", "push r14", "push r13", "push r12",
-        "push r11", "push r10", "push r9",  "push r8",
-        "push rbp", "push rdi", "push rsi", "push rdx",
-        "push rcx", "push rbx", "push rax",
-        "mov rdi, rsp",
-        "call {handler}",
-        "pop rax", "pop rbx", "pop rcx", "pop rdx",
-        "pop rsi", "pop rdi", "pop rbp",
-        "pop r8",  "pop r9",  "pop r10", "pop r11",
-        "pop r12", "pop r13", "pop r14", "pop r15",
-        "iretq",
-        handler = sym timer_handler_rust,
-    );
-}
-
-// =================================================================
 // Setup de TSS + boot do primeiro ring 3
 // =================================================================
 
@@ -453,8 +355,6 @@ pub fn install() {
 /// - CR3 atual cobre `entry_rip` (UserRx) e `user_rsp - 0x1000` (UserRw).
 /// - GDT carregada (gdt::init).
 /// - TSS.RSP0 setado (`install`).
-/// - `domain::set_current(dh)` ja foi chamada para o dominio
-///   correspondente, senao timer upcalls vao falhar silenciosamente.
 #[unsafe(naked)]
 pub unsafe extern "sysv64" fn enter_ring3(entry_rip: u64, user_rsp: u64) -> ! {
     core::arch::naked_asm!(
@@ -462,7 +362,7 @@ pub unsafe extern "sysv64" fn enter_ring3(entry_rip: u64, user_rsp: u64) -> ! {
         "mov ds, ax", "mov es, ax", "mov fs, ax", "mov gs, ax",
         "push {user_ds}",
         "push rsi",       // user_rsp
-        "push 0x202",     // RFLAGS: bit1=1 reservado, IF=1 (timer pode upcall)
+        "push 0x002",     // RFLAGS: bit1=1 reservado, IF=0 (sem IRQs hw)
         "push {user_cs}",
         "push rdi",       // entry_rip
         "iretq",
