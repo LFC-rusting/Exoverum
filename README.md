@@ -49,9 +49,9 @@ the kernel implements each one.
 | # | Principle | Status | Where |
 |---|-----------|--------|-------|
 | 1 | **Separate protection and management** | strict | the kernel only audits (W^X in `domain::map`, CDT in `revoke`, rights in `cap_grant`); no allocator, scheduler, file-system or IPC protocol lives in kernel space |
-| 2 | **Expose allocation** | strict | `retype_untyped(src, dst, n)` — the application chooses the size; the kernel only checks the watermark |
+| 2 | **Expose allocation** | strict | `retype_untyped(src, dst, offset, size)` — the LibOS chooses *both* the offset inside the parent and the size; the kernel only checks bounds and sibling non-overlap. No watermark, no kernel policy on placement |
 | 3 | **Expose names** | strict | capabilities carry physical addresses (`Frame{phys}`, `Untyped{base, size}`) and dense numeric handles (`Domain{handle}`); no virtual translations |
-| 4 | **Expose revocation** | seL4-style | `revoke` (local) and `revoke_granted` (cross-CSpace) deliver a `Repossession` upcall to every affected domain; the model is *force + notify* (security > liveness), explicitly chosen over Aegis-style negotiation |
+| 4 | **Expose revocation** | strict | `revoke` (local CDT) and `revoke_granted` (cross-CSpace) atomically remove every derived capability. Affected domains discover the loss *synchronously* on their next invocation of the now-empty slot (`lookup` returns `SlotEmpty`). No upcall is imposed by the kernel — detection and response are LibOS policy |
 | 5 | **Expose information** | minimal by design | the kernel keeps its read-only data structures small; LibOS-visible counters (free frames, ticks) are added only when a real LibOS asks for them |
 
 Kaashoek–1997 §3.3 (*protected sharing*) is covered by `cap_grant` plus
@@ -68,11 +68,11 @@ at **≤ 4.5k Lines of Code**. Current footprint is:
 | Artifact | LoC |
 |---|---|
 | Bootloader | ~1.1k LoC |
-| Kernel | ~2.9k LoC |
-| Crates | ~0.6k LoC |
+| Kernel | ~2.6k LoC |
+| Crates | ~60 LoC |
 
 Host test suite:
-**49 tests, all passing**.
+**65 tests, all passing** (51 kernel + 10 bootloader + 4 bootinfo).
 
 Phases below summarize what each milestone delivered. Every phase
 delivers only *mechanism*; schedulers, IPC protocols, file systems
@@ -117,22 +117,20 @@ and any other abstraction live in user-space LibOSes (Engler–1995
   priority, EDF, lottery, gang scheduling, all of it lives in the LibOS.
   Different LibOSes can run incompatible policies side-by-side.
 
-- **Phase 5b — periodic timer & IRQ stub.** The local APIC is up and a one-shot timer is wired to a
-  dedicated interrupt vector. The current handler is a stub: it logs and
-  rearms.
-
-  The full *upcall* path — handing the remaining quantum to a
-  LibOS-registered entry point — lands together with user-mode in
-  Phase 7, reusing the same machinery as syscalls (separate stack,
-  saving the full register state, the privilege-boundary dance). When
-  that arrives, failing to respond within a fixed deadline triggers
-  fail-stop (security > liveness).
+- **Phase 5b — (removed).** An earlier milestone wired up the local
+  APIC with a one-shot timer and a stub handler that logged ticks,
+  intended to later carry preemptive upcalls into ring 3. It was
+  **removed from the kernel**: a timer is *policy* ("how often should
+  a LibOS be preempted?"), not mechanism. A future LibOS that wants
+  preemption receives the LAPIC as a capability and programs it
+  itself. The kernel currently configures no hardware interrupt
+  source; ring 3 runs until it issues a voluntary syscall or faults.
 
 - **Phase 6 — Cooperative scaffolding** (subsumed by Phase 7b). The
   cooperative thread + single-bit event primitives that exercised
   `Ready` ↔ `Waiting` transitions before user-mode existed have been
   removed from the kernel. They are subsumed by ring-3 domains plus
-  PCT/upcalls (Aegis-style, Engler-1995 §4).
+  synchronous PCT (Engler-1995 §4).
 
 - **Phase 7 — exokernel proper.** **Kernel mechanisms only.**
   Phase 7 does **not** create a LibOS, an OS personality, a runtime, or
@@ -152,12 +150,12 @@ and any other abstraction live in user-space LibOSes (Engler–1995
     `CapTable`, `Frame`/`Domain` capability variants, `domain::map`
     auditing capability rights against W^X bits before writing PTEs.
 
-  - **7b — Upcalls, control transfer & cross-domain capabilities.**
+  - **7b — Control transfer & cross-domain capabilities.**
     A complete `UserContext` (15 GPRs + iret frame) is saved on the
     syscall stack and exposed as `*mut UserContext` to the kernel
-    dispatcher; the dispatcher rewrites it in-place to switch domain
-    or to deliver an upcall, and the trampoline's `iretq` carries
-    whatever ring-3 state the kernel committed.
+    dispatcher; the dispatcher rewrites it in-place to switch domain,
+    and the trampoline's `iretq` carries whatever ring-3 state the
+    kernel committed.
 
     Delivered:
 
@@ -166,20 +164,21 @@ and any other abstraction live in user-space LibOSes (Engler–1995
       target }` in the caller's CSpace, switches CR3 and resumes the
       callee at its programmed entry; `domain_reply(value)` (syscall
       3) restores the caller with `RAX = value`.
-    - **Upcall framework** — `Domain` exposes `upcall_entry`/
-      `upcall_stack`. Whenever the timer (or any future fault/repossession
-      vector) interrupts ring 3, the kernel saves `pre_upcall_ctx` and
-      rewrites the iret frame to dispatch into the domain's handler;
-      the handler returns via `upcall_return` (syscall 4). The timer
-      handler differentiates `CPL=0` (kernel: log + EOI + rearm) from
-      `CPL=3` (domain: deliver upcall) using the saved `cs & 3` bit.
     - **`cap_grant`** — transfers a capability between distinct CSpaces
       with monotonic rights attenuation. The granted cap lands as a
       root in the destination CSpace; the type and the `phys`/`handle`
       payload travel unchanged.
     - **Scaffolding removed** — `thread.rs` and `event.rs` are gone
       from the kernel. Whoever runs in ring 3 implements its own
-      threads and synchronization on top of PCT and upcalls.
+      threads and synchronization on top of PCT.
+
+    **No kernel-imposed upcall mechanism.** Earlier drafts shipped an
+    `upcall_entry`/`upcall_stack` pair per domain plus a fifth syscall
+    (`upcall_return`) so the kernel could preempt a LibOS to deliver
+    timer ticks or revocation notifications. That was **removed**:
+    *when and how* a LibOS should be notified of an event is policy,
+    not mechanism. The kernel now only has four syscalls (0–3), and
+    any notification machinery lives entirely in ring 3.
 
   The kernel guarantees only capability validation, domain isolation
   and correct context switch. Message formats, buffering, scheduling
@@ -190,24 +189,25 @@ and any other abstraction live in user-space LibOSes (Engler–1995
 - **Phase 8 — hardening & verification.** Closes the exokernel
   loop with the security primitives that finish the Engler–1995 model.
 
-  - **Visible cross-CSpace revocation.** A small parallel table
-    (`domain::GRANTS`, capacity 32) records every `cap_grant`. The
-    new operation `domain::revoke_granted(src_dh, src_slot)` walks
-    the table, removes each derived destination capability, and
-    marks the affected domain with a `pending_upcall =
-    Repossession`. This is the in-kernel half of seL4-style visible
-    revocation — LibOSes find out *promptly* that they have lost a
-    capability, never silently or out of band.
-  - **Repossession upcall (proactive).** When a domain holding a
-    `pending_upcall` is next given the CPU — either via
-    `domain_call` or by a timer tick — the kernel jumps to its
-    `upcall_entry` with `RDI = UpcallReason` *before* the normal
-    entry runs. The handler returns through `upcall_return` (syscall
-    4) and execution resumes where it would have gone otherwise.
-  - **Abort protocol.** Every CPU exception now goes through a
+  - **Visible cross-CSpace revocation (synchronous).** A small
+    parallel table (`domain::GRANTS`, capacity 32) records every
+    `cap_grant`. The operation `domain::revoke_granted(src_dh,
+    src_slot)` walks the table and removes each derived destination
+    capability from the recipient's CSpace. The recipient notices
+    synchronously on its next invocation of the slot: `lookup`
+    returns `SlotEmpty`, the owning syscall (e.g. `domain::map`)
+    fails, and the LibOS can react however it wants. *Mechanism is
+    "the cap is gone from your CSpace"*; the response is policy.
+  - **Exposed allocation in retype.** `retype_untyped(src, dst,
+    offset, size)` takes both the offset within the parent and the
+    new child's size from the LibOS. The kernel validates that the
+    new range lies inside the parent and does not overlap any
+    existing sibling. There is no in-kernel watermark (Kaashoek–1997
+    §3.1 principle #2, in its strict form).
+  - **Abort protocol.** Every CPU exception goes through a
     `fault_dispatch` that splits on `cs & 3`. CPL=0 means the kernel
     faulted: log + halt, security over liveness. CPL=3 means the
-    active domain faulted: `domain::abort_current(Fault)` marks it
+    active domain faulted: `domain::abort_current()` marks it
     `aborted = true`, clears `CURRENT`, and halts (a future
     scheduler will pick another LibOS instead of halting). Two naked
     trampolines (`fault_no_err_entry`, `fault_with_err_entry`) handle
@@ -217,18 +217,21 @@ and any other abstraction live in user-space LibOSes (Engler–1995
   - **Tech debt cleanup.** `CapObject::Thread` and `CapObject::Event`
     — dead since Phase 7b removed the scaffolding — are gone from
     `cap.rs`. The capability enum now has only the three live
-    variants: `Untyped`, `Frame`, `Domain`.
-  - **Adversarial host tests.** 10 new tests in `cap::tests` cover
-    `copy` from empty/aliased slots, double `revoke`, out-of-range
-    `delete`, `Frame`/`Domain` round-trips, and `CapRights::contains`
-    algebraic properties. Total: **49 host tests, all passing**.
+    variants: `Untyped`, `Frame`, `Domain`. The APIC timer module and
+    the upcall machinery are likewise gone.
+  - **Adversarial host tests.** `cap::tests` covers `copy` from
+    empty/aliased slots, double `revoke`, out-of-range `delete`,
+    `Frame`/`Domain` round-trips, `CapRights::contains` algebraic
+    properties, sibling-overlap rejection on retype, and offset
+    overflow defense. Total: **65 host tests, all passing**
+    (51 kernel + 10 bootloader + 4 bootinfo).
 
   **Out of scope, deferred to LibOS work** (not the kernel): async
-  PCT (one-way `domain_send`), preemptive scheduling policy, deadline
-  enforcement on repossession (kernel currently relies on the
-  domain's own cooperative response). These are *policy* in the
-  Engler-1995 sense and cannot live in an exokernel; whoever needs
-  them implements them in ring 3.
+  PCT (one-way `domain_send`), preemptive scheduling policy, any
+  notification protocol on top of revocation (timer ticks,
+  repossession callbacks, fault forwarding). These are *policy* in
+  the Engler-1995 sense and cannot live in an exokernel; whoever
+  needs them implements them in ring 3.
 
   **At the end of Phase 8 the exokernel is complete.** No LibOS is
   required for the kernel to boot, validate every Phase 7 + Phase 8
@@ -255,14 +258,14 @@ kernel/                 Bare-metal ELF binary
   src/log.rs, panic.rs  logging + panic
   src/arch/x86_64/      cpu / gdt / idt / serial (unsafe isolated)
   src/mm/               frame, paging (+ unsafe boundary in mod.rs)
-  src/cap.rs            capabilities flat-table + CDT + local revoke + 26 host tests
-  src/domain.rs         Domain (CR3 + CSpace + upcall/saved_ctx + aborted/pending) +
-                        PCT + cap_grant + GRANTS + revoke_granted + abort_current
-  src/arch/x86_64/apic.rs      LAPIC init + timer one-shot + EOI (Phase 5b)
-  src/arch/x86_64/idt.rs       IDT + fault_dispatch (Phase 8: CPL split + abort)
+  src/cap.rs            capabilities flat-table + CDT + local revoke + host tests
+                        (retype with LibOS-chosen offset, sibling-overlap check)
+  src/domain.rs         Domain (CR3 + CSpace + saved_ctx + aborted) +
+                        PCT + cap_grant + GRANTS + synchronous revoke_granted +
+                        abort_current
+  src/arch/x86_64/idt.rs       IDT + fault_dispatch (CPL split + abort)
   src/arch/x86_64/userland.rs  ring-3 entry/exit + UserContext save/restore +
-                               syscall dispatch (5 calls) + timer upcall trampoline +
-                               upcall handler payload
+                               syscall dispatch (4 calls: nop, exit, call, reply)
   linker.ld             kernel layout (VMA 0xFFFFFFFF80200000, LMA 0x200000)
 ```
 
@@ -299,7 +302,7 @@ rustup target add x86_64-unknown-none
 make            # build bootloader + kernel + compose the FAT32 .img
 make run        # boot in QEMU (serial -> stdout)
 make run-debug  # QEMU stopped on -S -s with -d int,cpu_reset (gdb on :1234)
-make test       # 49 host unit tests (cap, paging, frame, ELF, SHA-256, ...)
+make test       # 65 host unit tests (cap, paging, frame, ELF, SHA-256, ...)
 make clean
 ```
 
@@ -320,7 +323,7 @@ cargo build --release -p kernel --target x86_64-unknown-none
 cargo build-bootloader-release
 cargo build-kernel-release
 
-# 2. Run the host tests (49 tests, no QEMU needed):
+# 2. Run the host tests (65 tests, no QEMU needed):
 cargo test-host
 ```
 
@@ -374,17 +377,12 @@ The `make run` (or the equivalent QEMU invocation above) produces:
 [kernel] physmap ok: map+physmap views coherent
 [kernel] cap root + 3 descendants created
 [kernel] global revoke ok; root intact
-[kernel] apic ok; arming timer
-[kernel] timer tick                         <-- LAPIC IRQ 0x40
-[kernel] timer tick
-[kernel] timer tick
-[kernel] timer demo done; 3 ticks observed
 [kernel] demo_userland: setup
 [kernel] cap_grant A->B ok                                   <-- cross-CSpace transfer (7b)
-[kernel] revoke_granted A.slot0 ok                           <-- visible revocation (8)
+[kernel] revoke_granted A.slot0 ok                           <-- synchronous revocation (8)
 [kernel] demo_userland: enter A                              <-- iretq into ring 3 (A)
-[kernel] pct_call -> upcall (repossession)                   <-- repossession upcall (8)
-[kernel] pct_reply ok                                        <-- B.domain_reply after handler
+[kernel] pct_call ok                                         <-- A -> B (synchronous)
+[kernel] pct_reply ok                                        <-- B.domain_reply(0x42)
 [kernel] ring 3 exit; halting                                <-- A resumes, exits
 ```
 
@@ -433,23 +431,21 @@ bootloader configuration, no GRUB, no NVRAM entry needed.
 
 ## What the in-tree demo exercises
 
-The kernel ships with a single ~25-line ring-3 demo (`kmain::demo_userland`)
+The kernel ships with a single ring-3 demo (`kmain::demo_userland`)
 that drives every Phase 7 + Phase 8 mechanism through one trace:
 ring-3 isolation (two domains with distinct CR3s and CSpaces),
 audited paging (`domain::map` rejects `UserRw` over a
-`CapRights::READ` cap), INT-0x80 syscall path with
-save/restore of a full `UserContext`, `cap_grant` (A grants
-`Frame` to B and the kernel records the grant), `revoke_granted`
-(kernel revokes the grant and arms a `pending_upcall =
-Repossession` on B), and the **proactive upcall delivery**: when
-A finally calls `domain_call(B)`, the kernel notices B's pending
-upcall and dispatches B's `upcall_entry` (with `RDI = 2`)
-*before* its normal entry. The handler invokes `upcall_return`,
-which restores the pre-upcall context and runs B's normal entry,
-which in turn replies `0x42` to A via `domain_reply`. A resumes,
-exits, and the kernel halts. Every privilege boundary, every
-capability check and every state machine touched by the protocol
-is covered by this single ~25-line demo.
+`CapRights::READ` cap), INT-0x80 syscall path with save/restore of a
+full `UserContext`, `cap_grant` (A grants `Frame` to B and the kernel
+records the grant), synchronous `revoke_granted` (the grant is
+removed from B's CSpace — if B later invoked the slot, the syscall
+would fail cleanly with `SlotEmpty`), and **synchronous PCT**: A
+calls `domain_call(B)`, the kernel switches CR3 and resumes B at its
+programmed entry; B replies `0x42` via `domain_reply`; A sees the
+value in `RAX`, issues `exit`, and the kernel halts. Every privilege
+boundary, every capability check and every state machine touched by
+the protocol is covered by this demo — no kernel-imposed upcall, no
+timer, no in-kernel policy.
 
 ## Security rules
 
