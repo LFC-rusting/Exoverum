@@ -58,20 +58,19 @@ struct IdtPtr {
     base: u64,
 }
 
-/// (Phase 8) Dispatcher comum de exception. Recebe ctx canonico
-/// (`UserContext`) — para vetores com error code, o trampolim ja
-/// descartou o errcode com `add rsp, 8`. Decide por CPL:
+/// Dispatcher comum de exception. Recebe ctx canonico (`UserContext`) —
+/// para vetores com error code, o trampolim ja descartou o errcode com
+/// `add rsp, 8`. Decide por CPL:
 ///   - **CPL=0**: kernel faltou; loga e halta (security > liveness).
 ///   - **CPL=3**: dominio user faltou; chama `domain::abort_current`
-///     que marca aborted e zera CURRENT, depois halta (futuro:
-///     escolher proxima LibOS pronta).
+///     que marca aborted e zera CURRENT, depois halta.
 #[no_mangle]
 extern "sysv64" fn fault_dispatch(ctx: *mut super::userland::UserContext) -> ! {
     // SAFETY: ctx aponta para UserContext valido na stack do handler.
     let ctx_ref = unsafe { &*ctx };
     let cpl = ctx_ref.cs & 3;
     if cpl == 3 {
-        crate::domain::abort_current(crate::domain::UpcallReason::Fault);
+        crate::domain::abort_current();
         crate::log::write_str("[kernel] ring-3 fault; halting\n");
     } else {
         crate::log::write_str("[kernel] EXCEPTION ring-0 - halt\n");
@@ -113,22 +112,6 @@ unsafe extern "sysv64" fn fault_with_err_entry() {
     );
 }
 
-/// Contador global de ticks do LAPIC timer. Incrementa em cada IRQ 0x40.
-pub static TIMER_TICKS: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
-
-/// Reload do one-shot em cada tick (LAPIC DCR-16). Em QEMU TCG, valor
-/// empirico para ~0.1-0.2s por tick; valor nao-critico (so diagnostico).
-const TIMER_RELOAD_COUNT: u32 = 10_000_000;
-
-/// Exposto para o kmain armar o primeiro disparo com mesmo reload.
-pub const fn timer_reload() -> u32 { TIMER_RELOAD_COUNT }
-
-// Phase 7b: o trampolim do timer agora vive em `arch::x86_64::userland`
-// (`timer_handler_entry`), pois precisa salvar `UserContext` completo
-// para entregar upcall ao dominio ring 3 quando o tick interrompe ring 3.
-// O IDT abaixo aponta para esse simbolo.
-
 /// Inicializa IDT e carrega no core.
 pub fn init() {
     // Cast via *const () para satisfazer lint `function_casts_as_integer`
@@ -160,13 +143,7 @@ pub fn init() {
         // a stack do kernel estiver corrompida (recomendacao Intel SDM).
         (*idt.add(8)).set(h_with_err, KERNEL_CS, 1, INTERRUPT_GATE);
 
-        // LAPIC timer no vector 0x40. Trampolim em `userland.rs` salva
-        // UserContext inteiro para suportar upcalls ring 3 (Phase 7b).
-        let timer = super::userland::timer_handler_entry as *const () as usize as u64;
-        (*idt.add(super::apic::TIMER_VECTOR as usize))
-            .set(timer, KERNEL_CS, 0, INTERRUPT_GATE);
-
-        // Phase 7a.2: vetor 0x80 = porta de syscall vinda de ring 3.
+        // Vetor 0x80 = porta de syscall vinda de ring 3.
         // type_attr 0xEE: P=1, DPL=3 (acessivel a user), Type=0xE (int gate).
         const USER_INTERRUPT_GATE: u8 = 0xEE;
         let syscall = super::userland::syscall_handler_addr();
