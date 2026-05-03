@@ -59,13 +59,11 @@ impl CapRights {
 pub enum CapObject {
     /// Regiao de memoria fisica nao-tipada `[base, base + size)`.
     ///
-    /// `free_index` e o watermark de alocacao: cada `retype_untyped` cria um
-    /// filho em `[base + free_index, base + free_index + n)` e avanca
-    /// `free_index += n`. Isso garante que dois filhos **nunca** se sobreponham
-    /// (invariante fundamental de capabilities: sem aliasing nao-rastreavel).
-    /// `revoke` do proprio Untyped reseta `free_index = 0` (todos os filhos
-    /// ja foram destruidos e a regiao pode ser reusada).
-    Untyped { base: u64, size: u64, free_index: u64 },
+    /// Retype exige `(offset, size)` explicitos do chamador (LibOS):
+    /// kernel so valida bounds e non-overlap com irmaos existentes.
+    /// Mecanismo, nao politica — LibOS escolhe onde alocar (expose
+    /// allocation, Engler-1995 §3).
+    Untyped { base: u64, size: u64 },
     /// Frame fisico de 4 KiB em `phys`. Concedida a um dominio, da o direito
     /// de mapea-lo no proprio espaco de enderecamento via `domain::map`
     /// (Phase 7a.6). Os bits de proteção saem de `CapRights`: WRITE permite
@@ -167,17 +165,24 @@ impl CapTable {
         Ok(())
     }
 
-    /// Cria em `dst` um novo Untyped filho de `src`, consumindo `new_size`
-    /// bytes a partir do watermark `free_index` de `src`. Falha se `src` nao
-    /// e Untyped, se `new_size == 0`, ou se extrapolar o que resta.
+    /// Cria em `dst` um novo Untyped filho de `src` em
+    /// `[base + offset, base + offset + size)`. LibOS escolhe
+    /// `offset` e `size`; kernel so valida:
     ///
-    /// O kernel escolhe a base: **impossivel** obter dois filhos sobrepostos.
+    ///   - `src` e Untyped;
+    ///   - `size > 0`;
+    ///   - `offset + size <= src.size` (dentro do pai);
+    ///   - nao ha sobreposicao com irmaos ja criados.
+    ///
+    /// Exokernel puro: kernel expoe o recurso, LibOS decide
+    /// a politica de alocacao (Engler-1995 §3: expose allocation).
     #[allow(unreachable_patterns)] // ramo WrongType ativa com novos CapObject
     pub fn retype_untyped(
         &mut self,
         src: CapSlot,
         dst: CapSlot,
-        new_size: u64,
+        offset: u64,
+        size: u64,
     ) -> Result<(), CapError> {
         self.check_range(src)?;
         self.check_range(dst)?;
@@ -187,31 +192,56 @@ impl CapTable {
         if !matches!(self.entries[dst as usize], CapEntry::Empty) {
             return Err(CapError::SlotOccupied);
         }
-        if new_size == 0 {
+        if size == 0 {
             return Err(CapError::InvalidRetype);
         }
-        let (base, size, free_index, rights) = match self.entries[src as usize] {
+        let (parent_base, parent_size, rights) = match self.entries[src as usize] {
             CapEntry::Cap {
-                object: CapObject::Untyped { base, size, free_index },
+                object: CapObject::Untyped { base, size },
                 rights,
                 ..
-            } => (base, size, free_index, rights),
+            } => (base, size, rights),
             CapEntry::Cap { .. } => return Err(CapError::WrongType),
             CapEntry::Empty => return Err(CapError::SlotEmpty),
         };
-        let remaining = size - free_index;
-        if new_size > remaining {
+        // Bounds check com overflow-safe.
+        let end = offset
+            .checked_add(size)
+            .ok_or(CapError::InvalidRetype)?;
+        if end > parent_size {
             return Err(CapError::InvalidRetype);
         }
-        let new_base = base + free_index;
-        let new_free = free_index + new_size;
-        // Avanca watermark de `src` ANTES de linkar (atomico em rel. a falhas).
-        if let CapEntry::Cap { object: CapObject::Untyped { free_index, .. }, .. } =
-            &mut self.entries[src as usize]
-        {
-            *free_index = new_free;
+        let new_base = parent_base + offset;
+        let new_end = new_base + size;
+        // Non-overlap check: varre sibling chain de `src.first_child`.
+        // Cada irmao Untyped ocupa [child.base, child.base+child.size);
+        // rejeita se interseciona [new_base, new_end).
+        let mut sib = match self.entries[src as usize] {
+            CapEntry::Cap { first_child, .. } => first_child,
+            _ => NULL_SLOT,
+        };
+        while sib != NULL_SLOT {
+            let (s_base, s_size, s_next) = match self.entries[sib as usize] {
+                CapEntry::Cap {
+                    object: CapObject::Untyped { base, size },
+                    next_sibling,
+                    ..
+                } => (base, size, next_sibling),
+                CapEntry::Cap { next_sibling, .. } => (0, 0, next_sibling),
+                CapEntry::Empty => break,
+            };
+            if s_size != 0 {
+                let s_end = s_base + s_size;
+                // Overlap sse max(bases) < min(ends).
+                let max_base = if new_base > s_base { new_base } else { s_base };
+                let min_end = if new_end < s_end { new_end } else { s_end };
+                if max_base < min_end {
+                    return Err(CapError::InvalidRetype);
+                }
+            }
+            sib = s_next;
         }
-        let child_object = CapObject::Untyped { base: new_base, size: new_size, free_index: 0 };
+        let child_object = CapObject::Untyped { base: new_base, size };
         self.link_child(src, dst, child_object, rights);
         Ok(())
     }
@@ -231,9 +261,6 @@ impl CapTable {
     /// Revoga recursivamente TODOS os descendentes de `slot`. O proprio slot
     /// permanece. E o primitivo de seguranca: apos `revoke(slot)`, nenhuma
     /// capability derivada de `slot` continua valida.
-    ///
-    /// Adicionalmente: se `slot` e um `Untyped`, `free_index` e resetado
-    /// (toda a regiao ficou disponivel para novos retypes).
     pub fn revoke(&mut self, slot: CapSlot) -> Result<(), CapError> {
         self.check_range(slot)?;
         if matches!(self.entries[slot as usize], CapEntry::Empty) {
@@ -252,13 +279,6 @@ impl CapTable {
             }
             self.revoke(child)?;
             self.unlink_and_clear(child)?;
-        }
-        // Reseta watermark se Untyped (todos filhos ja sumiram).
-        if let CapEntry::Cap {
-            object: CapObject::Untyped { free_index, .. }, ..
-        } = &mut self.entries[slot as usize]
-        {
-            *free_index = 0;
         }
         Ok(())
     }
@@ -356,7 +376,7 @@ mod tests {
     use super::*;
 
     fn mk_untyped(base: u64, size: u64) -> CapObject {
-        CapObject::Untyped { base, size, free_index: 0 }
+        CapObject::Untyped { base, size }
     }
 
     #[test]
@@ -443,31 +463,26 @@ mod tests {
     }
 
     #[test]
-    fn retype_aloca_a_partir_do_watermark() {
+    fn retype_respeita_offset_do_libos() {
+        // LibOS escolhe offset=0: filho fica em parent.base.
         let mut t = CapTable::new();
         t.insert_root(0, mk_untyped(0x1000, 0x4000), CapRights::ALL).unwrap();
-        t.retype_untyped(0, 1, 0x1000).unwrap();
+        t.retype_untyped(0, 1, 0, 0x1000).unwrap();
         match t.lookup(1).unwrap().0 {
-            CapObject::Untyped { base, size, free_index } => {
-                assert_eq!(base, 0x1000, "primeiro filho comeca em parent.base");
+            CapObject::Untyped { base, size } => {
+                assert_eq!(base, 0x1000);
                 assert_eq!(size, 0x1000);
-                assert_eq!(free_index, 0, "filho novo comeca com free_index zero");
             }
-            _ => unreachable!("teste so cria Untyped"),
-        }
-        // Watermark de `src` avancou para 0x1000.
-        match t.lookup(0).unwrap().0 {
-            CapObject::Untyped { free_index, .. } => assert_eq!(free_index, 0x1000),
             _ => unreachable!("teste so cria Untyped"),
         }
     }
 
     #[test]
-    fn retype_irmaos_nao_aliasam() {
+    fn retype_irmaos_nao_aliasam_com_offsets_explicitos() {
         let mut t = CapTable::new();
         t.insert_root(0, mk_untyped(0x1000, 0x4000), CapRights::ALL).unwrap();
-        t.retype_untyped(0, 1, 0x1000).unwrap(); // [0x1000, 0x2000)
-        t.retype_untyped(0, 2, 0x1000).unwrap(); // [0x2000, 0x3000)
+        t.retype_untyped(0, 1, 0x0000, 0x1000).unwrap(); // [0x1000,0x2000)
+        t.retype_untyped(0, 2, 0x1000, 0x1000).unwrap(); // [0x2000,0x3000)
         let b1 = match t.lookup(1).unwrap().0 {
             CapObject::Untyped { base, .. } => base,
             _ => unreachable!("teste so cria Untyped"),
@@ -476,19 +491,37 @@ mod tests {
             CapObject::Untyped { base, .. } => base,
             _ => unreachable!("teste so cria Untyped"),
         };
-        assert_ne!(b1, b2, "irmaos nunca compartilham base");
-        assert_eq!(b2, b1 + 0x1000, "segundo filho vem logo apos o primeiro");
+        assert_eq!(b1, 0x1000);
+        assert_eq!(b2, 0x2000);
     }
 
     #[test]
-    fn retype_estoura_remaining() {
+    fn retype_rejeita_overlap_entre_irmaos() {
+        // LibOS maliciosa tenta criar filho sobre regiao ja alocada.
+        // Kernel DEVE rejeitar para nao permitir alias nao-rastreado.
+        let mut t = CapTable::new();
+        t.insert_root(0, mk_untyped(0x1000, 0x4000), CapRights::ALL).unwrap();
+        t.retype_untyped(0, 1, 0x0000, 0x2000).unwrap(); // [0x1000,0x3000)
+        assert_eq!(
+            t.retype_untyped(0, 2, 0x1000, 0x1000), // [0x2000,0x3000) overlap
+            Err(CapError::InvalidRetype)
+        );
+        assert_eq!(
+            t.retype_untyped(0, 2, 0x0800, 0x1000), // [0x1800,0x2800) overlap
+            Err(CapError::InvalidRetype)
+        );
+        // Offset logo apos o irmao funciona (bordas tocam, nao overlap).
+        t.retype_untyped(0, 2, 0x2000, 0x1000).unwrap(); // [0x3000,0x4000)
+    }
+
+    #[test]
+    fn retype_estoura_parent_size() {
         let mut t = CapTable::new();
         t.insert_root(0, mk_untyped(0x1000, 0x2000), CapRights::ALL).unwrap();
-        t.retype_untyped(0, 1, 0x1800).unwrap();
         assert_eq!(
-            t.retype_untyped(0, 2, 0x1000),
+            t.retype_untyped(0, 1, 0x1800, 0x1000),
             Err(CapError::InvalidRetype),
-            "restante insuficiente"
+            "offset+size > parent.size"
         );
     }
 
@@ -497,20 +530,31 @@ mod tests {
         let mut t = CapTable::new();
         t.insert_root(0, mk_untyped(0x1000, 0x4000), CapRights::ALL).unwrap();
         assert_eq!(
-            t.retype_untyped(0, 1, 0),
+            t.retype_untyped(0, 1, 0, 0),
             Err(CapError::InvalidRetype)
         );
     }
 
     #[test]
-    fn revoke_reseta_free_index() {
+    fn retype_offset_overflow_rejeitado() {
+        // Defesa contra overflow em offset+size.
         let mut t = CapTable::new();
         t.insert_root(0, mk_untyped(0x1000, 0x4000), CapRights::ALL).unwrap();
-        t.retype_untyped(0, 1, 0x2000).unwrap();
-        t.retype_untyped(0, 2, 0x1000).unwrap();
+        assert_eq!(
+            t.retype_untyped(0, 1, u64::MAX, 1),
+            Err(CapError::InvalidRetype)
+        );
+    }
+
+    #[test]
+    fn revoke_libera_regiao_para_novo_retype() {
+        let mut t = CapTable::new();
+        t.insert_root(0, mk_untyped(0x1000, 0x4000), CapRights::ALL).unwrap();
+        t.retype_untyped(0, 1, 0x0000, 0x2000).unwrap();
+        t.retype_untyped(0, 2, 0x2000, 0x1000).unwrap();
         t.revoke(0).unwrap();
-        // Apos revoke, watermark zerou; novo retype retorna ao inicio.
-        t.retype_untyped(0, 1, 0x1000).unwrap();
+        // Filhos sumiram; a regiao toda volta a ser retypeable.
+        t.retype_untyped(0, 1, 0, 0x1000).unwrap();
         match t.lookup(1).unwrap().0 {
             CapObject::Untyped { base, .. } => assert_eq!(base, 0x1000),
             _ => unreachable!("teste so cria Untyped"),
@@ -522,7 +566,7 @@ mod tests {
         let mut t = CapTable::new();
         t.insert_root(0, CapObject::Frame { phys: 0x1000 }, CapRights::ALL).unwrap();
         assert_eq!(
-            t.retype_untyped(0, 1, 0x1000),
+            t.retype_untyped(0, 1, 0, 0x1000),
             Err(CapError::WrongType),
             "retype so funciona em Untyped"
         );
@@ -670,21 +714,20 @@ mod tests {
         t.insert_root(0, mk_untyped(0, 0x4000), CapRights::ALL).unwrap();
         t.insert_root(1, mk_untyped(0x10_0000, 0x1000), CapRights::ALL).unwrap();
         assert_eq!(
-            t.retype_untyped(0, 1, 0x1000),
+            t.retype_untyped(0, 1, 0, 0x1000),
             Err(CapError::SlotOccupied)
         );
     }
 
     #[test]
-    fn retype_filho_tem_free_index_independente() {
-        // Filho tem seu proprio watermark (comeca em 0), nao herda do pai.
+    fn retype_em_filho_usa_base_do_filho() {
+        // Filho tem seu proprio espaco; neto fica em [filho.base + offset, ...).
         let mut t = CapTable::new();
         t.insert_root(0, mk_untyped(0x0000, 0x8000), CapRights::ALL).unwrap();
-        t.retype_untyped(0, 1, 0x2000).unwrap(); // parent watermark -> 0x2000
-        t.retype_untyped(1, 2, 0x1000).unwrap(); // retype DE dentro do filho 1
+        t.retype_untyped(0, 1, 0x2000, 0x2000).unwrap(); // filho em [0x2000,0x4000)
+        t.retype_untyped(1, 2, 0, 0x1000).unwrap();      // neto em [0x2000,0x3000)
         match t.lookup(2).unwrap().0 {
-            CapObject::Untyped { base, .. } => assert_eq!(base, 0x0000),
-            // ^ base do filho 1 era 0, watermark dele era 0, neto comeca em 0.
+            CapObject::Untyped { base, .. } => assert_eq!(base, 0x2000),
             _ => unreachable!("teste so cria Untyped"),
         }
     }
