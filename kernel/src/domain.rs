@@ -1,5 +1,4 @@
-//! Phases 7a/7b/8: dominios ring 3 com PCT, upcalls, cap_grant,
-//! visible cross-CSpace revocation e abort protocol.
+//! Dominios ring 3 com PCT sync, cap_grant e revocacao cross-CSpace.
 //!
 //! # Modelo
 //!
@@ -8,28 +7,25 @@
 //!   - **CSpace** propria (`CapTable` independente da do kernel);
 //!   - **Pontos de entrada** (`entry_rip`/`entry_rsp`) usados quando
 //!     outro dominio invoca este via PCT pela primeira vez;
-//!   - **Upcall handler** (`upcall_entry`/`upcall_stack`) usado quando
-//!     o kernel entrega evento (timer, fault, repossession) ao dominio;
-//!   - **Estado de PCT**: `caller`, `saved_ctx`, `pre_upcall_ctx`;
-//!   - **Flags de estado** (Phase 8): `pending_upcall` (upcall a
-//!     entregar na proxima entrada), `aborted` (dominio faulted; nao
-//!     pode mais ser escalonado).
+//!   - **Estado de PCT**: `caller`, `saved_ctx`;
+//!   - **Flags**: `aborted` (dominio faulted; nao pode mais ser
+//!     escalonado).
 //!
-//! # Visible cross-CSpace revocation (Phase 8)
+//! # Visible cross-CSpace revocation
 //!
 //! Uma tabela paralela (`GRANTS`) registra cada `cap_grant` (origem:
 //! `(src_dh, src_slot)`; destino: `(dst_dh, dst_slot)`).
-//! `revoke_granted(src_dh, src_slot)` varre, remove o destino da
-//! CSpace e marca cada dominio afetado com `pending_upcall =
-//! Repossession`. Na proxima entrada (PCT ou timer), o kernel
-//! preempta a execucao normal com um upcall de repossession.
+//! `revoke_granted(src_dh, src_slot)` varre e remove a cap do CSpace
+//! destino. O dominio destino descobre a revocacao de modo sincrono
+//! na proxima invocacao da cap (lookup retorna `SlotEmpty`): exokernel
+//! puro, sem upcall imposto pelo kernel.
 //!
-//! # Abort protocol (Phase 8)
+//! # Abort protocol
 //!
 //! Qualquer exception em CPL=3 (`#PF`, `#GP`, `#UD`, `#DE`) invoca
-//! `abort_current(kind)`: loga + marca `aborted = true` e retorna
-//! controle ao kernel (halt ou proxima LibOS, conforme politica).
-//! Seguranca > liveness: domain faulty nunca retoma execucao.
+//! `abort_current()`: loga + marca `aborted = true` e retorna
+//! controle ao kernel. Seguranca > liveness: domain faulty nunca
+//! retoma execucao.
 //!
 //! # Single-thread invariant
 //!
@@ -46,15 +42,6 @@ use crate::mm::{self, Perm};
 
 /// Numero maximo de dominios simultaneos. KISS.
 pub const MAX_DOMAINS: usize = 4;
-
-/// Razao do upcall, passada em RDI ao handler ring 3.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-#[repr(u64)]
-pub enum UpcallReason {
-    Timer = 0,
-    Fault = 1,
-    Repossession = 2,
-}
 
 /// Handle opaco para um dominio.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -102,15 +89,13 @@ pub enum DomainError {
     Busy,
     /// `pct_reply` sem caller registrado.
     NoCaller,
-    /// `upcall_return` sem ctx pre-upcall salvo.
-    NoSavedUpcall,
-    /// PCT/upcall com `CURRENT_DOMAIN` nulo.
+    /// PCT com `CURRENT_DOMAIN` nulo.
     NoCurrentDomain,
-    /// (Phase 8) Dominio alvo marcado como abortado.
+    /// Dominio alvo marcado como abortado.
     Aborted,
-    /// (Phase 8) `revoke_granted` em slot que nunca foi origem de grant.
+    /// `revoke_granted` em slot que nunca foi origem de grant.
     NoGrant,
-    /// (Phase 8) `GRANTS` cheio.
+    /// `GRANTS` cheio.
     GrantTableFull,
 }
 
@@ -130,27 +115,12 @@ struct DomainSlot {
     entry_rip: u64,
     /// RSP user inicial, idem.
     entry_rsp: u64,
-    /// Endereco do handler de upcall (timer, fault, etc.). Zero = sem
-    /// upcall handler; nesse caso, timer interrompendo ring 3 nao faz
-    /// nada alem de EOI+rearm.
-    upcall_entry: u64,
-    /// RSP user para o handler de upcall.
-    upcall_stack: u64,
     /// Quem chamou este dominio via `pct_call`. `None` = livre para receber.
     caller: Option<DomainHandle>,
     /// `UserContext` salvo quando este dominio foi *suspenso* por
     /// chamar outro (`pct_call`). Restaurado por `pct_reply` no callee.
     saved_ctx: UserContext,
-    /// `UserContext` salvo no momento em que um upcall interrompeu este
-    /// dominio. Restaurado por `syscall=4 upcall_return`. Bit `valid`
-    /// distingue "Some" sem precisar de Option (alinhamento simples).
-    pre_upcall_ctx: UserContext,
-    pre_upcall_valid: bool,
-    /// (Phase 8) Upcall pendente para o dominio (ex.: repossession
-    /// disparada por `revoke_granted`). `None` = sem nada pendente.
-    pending_upcall: Option<UpcallReason>,
-    /// (Phase 8) Dominio marcado como abortado — faulted ou teve
-    /// capabilities criticas repossessed. Nunca mais recebe CPU;
+    /// Dominio marcado como abortado — faulted. Nunca mais recebe CPU;
     /// `pct_call` para este dominio falha com `Aborted`.
     aborted: bool,
 }
@@ -163,13 +133,8 @@ impl DomainSlot {
             cspace: CapTable::new(),
             entry_rip: 0,
             entry_rsp: 0,
-            upcall_entry: 0,
-            upcall_stack: 0,
             caller: None,
             saved_ctx: UserContext::fresh(0, 0),
-            pre_upcall_ctx: UserContext::fresh(0, 0),
-            pre_upcall_valid: false,
-            pending_upcall: None,
             aborted: false,
         }
     }
@@ -245,26 +210,6 @@ pub fn set_entry(h: DomainHandle, rip: u64, rsp: u64) -> Result<(), DomainError>
     }
     table[idx].entry_rip = rip;
     table[idx].entry_rsp = rsp;
-    Ok(())
-}
-
-/// Programa `(upcall_entry, upcall_stack)`. Quando timer/fault interrompe
-/// o dominio em ring 3, o kernel salva o ctx atual, sobrescreve o iret
-/// frame para apontar aqui e retoma; o handler chama `syscall 4`
-/// (`upcall_return`) para voltar ao ponto interrompido.
-#[allow(dead_code)]
-pub fn set_upcall(h: DomainHandle, entry: u64, stack: u64) -> Result<(), DomainError> {
-    let idx = h.0 as usize;
-    if idx >= MAX_DOMAINS {
-        return Err(DomainError::BadHandle);
-    }
-    // SAFETY: idem.
-    let table = unsafe { &mut *DOMAINS.0.get() };
-    if !table[idx].in_use {
-        return Err(DomainError::BadHandle);
-    }
-    table[idx].upcall_entry = entry;
-    table[idx].upcall_stack = stack;
     Ok(())
 }
 
@@ -475,16 +420,14 @@ fn register_grant(
     Ok(())
 }
 
-/// Revoga visivelmente todas as caps que foram derivadas de
-/// `(src_dh, src_slot)` via `cap_grant`. Para cada destino afetado:
+/// Revoga todas as caps derivadas de `(src_dh, src_slot)` via
+/// `cap_grant`. Para cada destino, remove a entry da CSpace destino
+/// (`delete`); se ja foi deletada, ignora. O dominio destino descobre
+/// a perda de modo sincrono na proxima invocacao da cap (lookup
+/// retorna `SlotEmpty`). Exokernel puro: kernel nao notifica,
+/// mecanismo e 'cap sumiu do CSpace'.
 ///
-/// 1. Remove a entry da CSpace destino (`delete`); se ja foi
-///    deletada, ignora.
-/// 2. Marca `pending_upcall = Some(Repossession)` no dominio destino.
-///    O proximo `pct_call` ou timer-upcall entrega o aviso antes de
-///    retomar execucao normal — o dominio sabe que perdeu cap.
-///
-/// Retorna numero de destinos revogados (>= 0).
+/// Retorna numero de destinos revogados (>= 1) ou `NoGrant`.
 pub fn revoke_granted(
     src_dh: DomainHandle,
     src_slot: CapSlot,
@@ -505,12 +448,6 @@ pub fn revoke_granted(
             // Tenta deletar; se ja sumiu (dominio fez delete por
             // conta propria), ignora.
             let _ = table[dst_idx].cspace.delete(g.dst_slot);
-            // Marca repossession; nao sobrescreve outro pending
-            // pre-existente (preserva FIFO degenerado).
-            if table[dst_idx].pending_upcall.is_none() {
-                table[dst_idx].pending_upcall =
-                    Some(UpcallReason::Repossession);
-            }
         }
         g.in_use = false;
         count += 1;
@@ -522,14 +459,14 @@ pub fn revoke_granted(
 }
 
 // =================================================================
-// Abort protocol (Phase 8)
+// Abort protocol
 // =================================================================
 
 /// Marca o dominio em execucao como abortado e devolve controle ao
 /// kernel. Chamado pelos handlers de exception ring 3 em `idt.rs`.
 /// Apos esta chamada o dominio nunca mais e escalonado; `pct_call`
 /// apontando para ele falha com `Aborted`.
-pub fn abort_current(reason: UpcallReason) {
+pub fn abort_current() {
     let cur_h = match current() {
         Some(h) => h,
         None => return,
@@ -539,16 +476,10 @@ pub fn abort_current(reason: UpcallReason) {
     let table = unsafe { &mut *DOMAINS.0.get() };
     if idx < MAX_DOMAINS && table[idx].in_use {
         table[idx].aborted = true;
-        table[idx].pending_upcall = None;
         table[idx].caller = None;
     }
     set_current(None);
-    crate::log::write_str("[kernel] domain abort, reason=");
-    crate::log::write_str(match reason {
-        UpcallReason::Fault => "fault\n",
-        UpcallReason::Repossession => "repossession\n",
-        UpcallReason::Timer => "timer\n",
-    });
+    crate::log::write_str("[kernel] domain abort (ring-3 fault)\n");
 }
 
 // =================================================================
@@ -627,38 +558,13 @@ pub unsafe fn pct_call(
     let entry = table[tgt_idx].entry_rip;
     let rsp = table[tgt_idx].entry_rsp;
     let cr3 = table[tgt_idx].cr3;
-    let pending = table[tgt_idx].pending_upcall.take();
-    let upcall_entry = table[tgt_idx].upcall_entry;
-    let upcall_stack = table[tgt_idx].upcall_stack;
-    // (Phase 8) Se ha upcall pendente para o target e ele tem handler,
-    // entrega ANTES de tocar o entry normal: caller fica suspenso
-    // como sempre, mas o target acorda no upcall_entry com a razao
-    // em RDI.
-    let mut delivered_upcall = false;
-    let new_ctx = match pending {
-        Some(reason) if upcall_entry != 0 && upcall_stack != 0 => {
-            let mut c = UserContext::fresh(upcall_entry, upcall_stack);
-            c.rdi = reason as u64;
-            c.rflags = 0x002; // IF=0 enquanto handler roda
-            // pre_upcall_ctx aponta para a entrada normal: handler
-            // chama upcall_return e cai no servico de PCT.
-            table[tgt_idx].pre_upcall_ctx = UserContext::fresh(entry, rsp);
-            table[tgt_idx].pre_upcall_valid = true;
-            delivered_upcall = true;
-            c
-        }
-        _ => UserContext::fresh(entry, rsp),
-    };
+    let new_ctx = UserContext::fresh(entry, rsp);
     // SAFETY: idem.
     unsafe { *ctx = new_ctx };
     set_current(Some(target_h));
     // SAFETY: cr3 valido (clone_kernel_higher_half do target).
     unsafe { crate::arch::x86_64::cpu::load_cr3(cr3) };
-    if delivered_upcall {
-        crate::log::write_str("[kernel] pct_call -> upcall (repossession)\n");
-    } else {
-        crate::log::write_str("[kernel] pct_call ok\n");
-    }
+    crate::log::write_str("[kernel] pct_call ok\n");
     Ok(())
 }
 
@@ -692,77 +598,3 @@ pub unsafe fn pct_reply(
     Ok(())
 }
 
-// =================================================================
-// Upcalls (timer, fault, repossession)
-// =================================================================
-
-/// Tentativa de entrega de upcall por timer ao dominio em execucao.
-/// Se o dominio nao registrou upcall handler (`upcall_entry == 0`), o
-/// kernel apenas retorna sem mexer no ctx — ring 3 retoma onde estava.
-///
-/// Se ja ha um upcall em curso (`pre_upcall_valid == true`), evitamos
-/// nesting: simplesmente retornamos. Phase 8 hardening pode promover
-/// para upcall fila.
-///
-/// # Safety
-///
-/// `ctx` aponta para `UserContext` na stack; CPL=3 ja foi confirmado
-/// pelo caller (`timer_handler_rust`).
-pub unsafe fn timer_upcall(ctx: *mut UserContext) {
-    let cur_h = match current() {
-        Some(h) => h,
-        None => return,
-    };
-    let idx = cur_h.0 as usize;
-    // SAFETY: idem.
-    let table = unsafe { &mut *DOMAINS.0.get() };
-    if !table[idx].in_use || table[idx].aborted {
-        return;
-    }
-    if table[idx].upcall_entry == 0 || table[idx].upcall_stack == 0 {
-        return;
-    }
-    if table[idx].pre_upcall_valid {
-        // Upcall ja em curso; ignora (sem nesting).
-        return;
-    }
-    // (Phase 8) Repossession pendente tem prioridade sobre timer:
-    // entrega-a; senao, entrega timer.
-    let reason = table[idx]
-        .pending_upcall
-        .take()
-        .unwrap_or(UpcallReason::Timer);
-    // SAFETY: ctx valido.
-    let saved = unsafe { *ctx };
-    table[idx].pre_upcall_ctx = saved;
-    table[idx].pre_upcall_valid = true;
-    let entry = table[idx].upcall_entry;
-    let stack = table[idx].upcall_stack;
-    let mut new_ctx = UserContext::fresh(entry, stack);
-    new_ctx.rdi = reason as u64;
-    // IF=0 enquanto o dominio processa o upcall (evita nesting natural).
-    new_ctx.rflags = 0x002;
-    // SAFETY: ctx valido.
-    unsafe { *ctx = new_ctx };
-}
-
-/// `syscall=4 upcall_return`: restaura `pre_upcall_ctx`. O dominio
-/// retoma exatamente apos o ponto interrompido.
-///
-/// # Safety
-///
-/// Idem `pct_*`.
-pub unsafe fn upcall_return(ctx: *mut UserContext) -> Result<(), DomainError> {
-    let cur_h = current().ok_or(DomainError::NoCurrentDomain)?;
-    let idx = cur_h.0 as usize;
-    // SAFETY: idem.
-    let table = unsafe { &mut *DOMAINS.0.get() };
-    if !table[idx].pre_upcall_valid {
-        return Err(DomainError::NoSavedUpcall);
-    }
-    table[idx].pre_upcall_valid = false;
-    let saved = table[idx].pre_upcall_ctx;
-    // SAFETY: ctx valido.
-    unsafe { *ctx = saved };
-    Ok(())
-}
