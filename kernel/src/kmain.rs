@@ -7,9 +7,7 @@
 
 use bootinfo::BootInfo;
 
-use core::sync::atomic::Ordering;
-
-use crate::arch::x86_64::{apic, cpu, gdt, idt, userland};
+use crate::arch::x86_64::{cpu, gdt, idt, userland};
 use crate::cap::{CapObject, CapRights, CapTable};
 use crate::domain;
 use crate::log;
@@ -106,70 +104,36 @@ pub unsafe fn start(bootinfo: *const BootInfo) -> ! {
     // subregioes, revoga e confirma que todos os descendentes sumiram.
     demo_caps();
 
-    // Fase 5b: LAPIC timer one-shot + IRQ 0x40 -> handler stub. Prova
-    // mecanismo: ticks chegam, handler loga, EOI funciona, rearm OK.
-    // Sem preempcao com troca de contexto (essa entra na Fase 7 junto
-    // com TSS IST + swapgs / syscalls).
-    demo_timer();
-
-    // Phase 7a + 7b: smoke test ring 3 multi-dominio.
-    // - 7a: cria dominios com CR3+CSpace proprios, audita PTEs.
-    // - 7b: cap_grant entre dominios, PCT (domain_call/reply),
-    //   timer upcall ao dominio em execucao, scaffolding fora.
+    // Smoke test ring 3 multi-dominio: dominios com CR3+CSpace
+    // proprios, cap_grant entre dominios, PCT (domain_call/reply),
+    // visible cross-CSpace revocation sincrona.
     demo_userland();
 }
 
-/// Inicializa LAPIC, habilita IRQ 0x40, espera 3 ticks e desliga
-/// interrupcoes antes de retornar (proximas fases ainda assumem IF=0).
-fn demo_timer() {
-    // SAFETY: pos-init_paging; idt ja contem timer_handler_entry; chamada
-    // unica por boot.
-    if let Err(_) = unsafe { apic::init() } {
-        log::write_str("[kernel] apic init failed\n");
-        return;
-    }
-    log::write_str("[kernel] apic ok; arming timer\n");
-    // SAFETY: apic::init bem-sucedido garante MMIO mapeado.
-    unsafe { apic::arm_oneshot(idt::timer_reload()); }
-    cpu::sti();
-    // Espera busy-wait por 3 ticks (handler incrementa TIMER_TICKS).
-    while idt::TIMER_TICKS.load(Ordering::Relaxed) < 3 {
-        cpu::hlt();
-    }
-    cpu::cli();
-    log::write_str("[kernel] timer demo done; 3 ticks observed\n");
-}
-
-/// Phases 7a/7b/8 smoke test: dois dominios em ring 3 exercitam o
-/// caminho completo do exokernel.
+/// Smoke test: dois dominios em ring 3 exercitam o caminho completo
+/// do exokernel.
 ///
 ///   - **A** (cliente): faz `domain_call(B)`, espera o reply, sai.
-///   - **B** (servidor): tem dois pontos de entrada — uma entry normal
-///     que devolve 0x42 via `domain_reply`, e um upcall handler que
-///     so chama `upcall_return`.
+///   - **B** (servidor): recebe PCT, devolve 0x42 via `domain_reply`.
 ///
 /// Sequencia:
 ///   1. setup A, B; A recebe `Domain{B}` (autoriza PCT) e da
 ///      `cap_grant` de um Frame para B (slot 5).
-///   2. (Phase 8) Kernel chama `revoke_granted(A, 0)`: a cap doada para
-///      B e removida; B fica com `pending_upcall = Repossession`.
+///   2. Kernel chama `revoke_granted(A, 0)`: a cap doada e removida
+///      do CSpace de B. B descobre de modo sincrono se invocar o
+///      slot 5 (lookup retorna SlotEmpty).
 ///   3. `enter A`. A faz `domain_call(B)`.
-///   4. Kernel detecta pending_upcall; em vez de pular para a entry
-///      normal, dispara o upcall handler com `RDI = Repossession`.
-///   5. Handler faz `syscall=4 upcall_return`; B retoma sua entry
-///      normal e da `domain_reply(0x42)`.
-///   6. A continua, `mov rax,1; int 0x80` sai e o kernel halta.
+///   4. B executa, da `domain_reply(0x42)`.
+///   5. A continua, `mov rax,1; int 0x80` sai e o kernel halta.
 ///
 /// Cobre: ring-3 isolation, audited paging, INT-0x80 syscall, PCT
-/// sync (call+reply), cap_grant, visible cross-CSpace revocation,
-/// repossession upcall pro-ativo, save/restore de UserContext em
-/// dois niveis (pct caller + pre-upcall).
+/// sync (call+reply), cap_grant, visible cross-CSpace revocation
+/// sincrona sem upcall imposto pelo kernel.
 ///
 /// Funcao divergente.
 fn demo_userland() -> ! {
     const PAYLOAD_VA: u64 = 0x0000_0000_4000_0000;
     const STACK_VA: u64 = 0x0000_0000_5000_0000;
-    const UPCALL_VA: u64 = 0x0000_0000_6000_0000;
 
     log::write_str("[kernel] demo_userland: setup\n");
 
@@ -183,8 +147,6 @@ fn demo_userland() -> ! {
     };
 
     setup_domain(dh_b, userland::payload_b_bytes(), None, PAYLOAD_VA, STACK_VA);
-    // (Phase 8) Instala upcall handler em B reusando a stack de B.
-    setup_upcall(dh_b, userland::upcall_handler_bytes(), UPCALL_VA, STACK_VA);
 
     let patch_off = userland::payload_a_target_imm_offset();
     setup_domain(
@@ -211,8 +173,8 @@ fn demo_userland() -> ! {
     }
     log::write_str("[kernel] cap_grant A->B ok\n");
 
-    // (Phase 8) Visible cross-CSpace revocation: derruba a cap doada,
-    // marca pending_upcall em B. Sucesso = pelo menos 1 destino.
+    // Visible cross-CSpace revocation sincrona: cap sumiu do CSpace
+    // de B. Exokernel puro: sem upcall imposto.
     match domain::revoke_granted(dh_a, 0) {
         Ok(n) if n >= 1 => {
             log::write_str("[kernel] revoke_granted A.slot0 ok\n");
@@ -227,42 +189,6 @@ fn demo_userland() -> ! {
     // SAFETY: dh_a valido; payload e stack mapeados; RSP0 ok; IDT pronta.
     let _ = unsafe { domain::enter(dh_a, PAYLOAD_VA, user_rsp) };
     cpu::halt_forever();
-}
-
-/// (Phase 8) Mapeia o handler de upcall em `upcall_va` no dominio
-/// `dh` e programa `upcall_entry`/`upcall_stack`. A stack de upcall
-/// reusa `stack_va` da entry normal (handler trivial nao usa stack).
-fn setup_upcall(
-    dh: domain::DomainHandle,
-    bytes: &[u8],
-    upcall_va: u64,
-    stack_va: u64,
-) {
-    if bytes.len() > 4096 {
-        fail("setup_upcall: handler > 4 KiB");
-    }
-    let pf = mm::alloc_frame().unwrap_or_else(|| fail("setup_upcall: sem frame"));
-    // SAFETY: physmap ativo; pf recem-alocado.
-    unsafe {
-        let dst = mm::phys_to_virt(pf.addr());
-        let src = bytes.as_ptr();
-        let mut i = 0usize;
-        while i < bytes.len() {
-            dst.add(i).write(src.add(i).read());
-            i += 1;
-        }
-    }
-    // Slot 3 nao colide com 0/1 (frames da entry) nem 5 (cap_grant).
-    if domain::insert_root(dh, 3, CapObject::Frame { phys: pf.addr() }, CapRights::READ).is_err() {
-        fail("setup_upcall: insert cap falhou");
-    }
-    // SAFETY: pos-init_paging; va lower-half; perm user.
-    if unsafe { domain::map(dh, upcall_va, 3, Perm::UserRx) }.is_err() {
-        fail("setup_upcall: map handler falhou");
-    }
-    if domain::set_upcall(dh, upcall_va, stack_va + 0x1000).is_err() {
-        fail("setup_upcall: set_upcall falhou");
-    }
 }
 
 /// Setup completo de um dominio: aloca payload+stack, copia bytes
@@ -334,18 +260,17 @@ fn demo_caps() {
     let root = CapObject::Untyped {
         base: 0x10_0000,
         size: 0x10_0000,
-        free_index: 0,
     };
     if table.insert_root(0, root, CapRights::ALL).is_err() {
         log::write_str("[kernel] cap err: insert_root failed\n");
         return;
     }
     // Duas subregioes derivadas + uma copia atenuada do primeiro child.
-    // retype_untyped(src, dst, size): kernel escolhe base via watermark.
-    // Impossivel derivar dois filhos sobrepostos (bug critico de seguranca
-    // da API antiga com `new_base` livre).
-    if table.retype_untyped(0, 1, 0x4_0000).is_err()
-        || table.retype_untyped(0, 2, 0x4_0000).is_err()
+    // retype_untyped(src, dst, offset, size): LibOS escolhe offset
+    // dentro do parent. Kernel valida bounds e non-overlap entre
+    // irmaos (expose allocation: Engler 1995).
+    if table.retype_untyped(0, 1, 0x0_0000, 0x4_0000).is_err()
+        || table.retype_untyped(0, 2, 0x4_0000, 0x4_0000).is_err()
         || table.copy(1, 3, CapRights::READ).is_err()
     {
         log::write_str("[kernel] cap err: derivation failed\n");
