@@ -4,7 +4,7 @@
 //! `unsafe` carrega um comentário SAFETY. Sempre que possível delegamos parsing
 //! e verificação para o núcleo safe (`crate::elf`, `crate::crypto`).
 
-use bootinfo::MemoryMap;
+use bootinfo::{FramebufferInfo, MemoryMap};
 use core::ffi::c_void;
 use core::mem;
 use core::ptr::NonNull;
@@ -189,7 +189,11 @@ pub struct EfiBootServices {
     // Library Services
     pub protocols_per_handle: usize,
     pub locate_handle_buffer: usize,
-    pub locate_protocol: usize,
+    pub locate_protocol: unsafe extern "efiapi" fn(
+        protocol: *const Guid,
+        registration: *mut c_void,
+        interface: *mut *mut c_void,
+    ) -> Status,
     pub install_multiple_protocol_interfaces: usize,
     pub uninstall_multiple_protocol_interfaces: usize,
     // 32-bit CRC Services
@@ -232,6 +236,44 @@ pub const EFI_FILE_INFO_GUID: Guid = Guid {
     data3: 0x11d2,
     data4: [0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
 };
+
+// EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID (UEFI 2.9 §11.9): a unica porta de
+// acesso ao framebuffer linear pos-firmware. Usado para entregar
+// `FramebufferInfo` ao kernel (validacao visual em bare metal).
+pub const EFI_GOP_GUID: Guid = Guid {
+    data1: 0x9042a9de,
+    data2: 0x23dc,
+    data3: 0x4a38,
+    data4: [0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a],
+};
+
+#[repr(C)]
+pub struct EfiGopModeInfo {
+    pub version: u32,
+    pub horizontal_resolution: u32,
+    pub vertical_resolution: u32,
+    pub pixel_format: u32,
+    pub pixel_information: [u32; 4],
+    pub pixels_per_scan_line: u32,
+}
+
+#[repr(C)]
+pub struct EfiGopMode {
+    pub max_mode: u32,
+    pub mode: u32,
+    pub info: *mut EfiGopModeInfo,
+    pub size_of_info: usize,
+    pub framebuffer_base: u64,
+    pub framebuffer_size: usize,
+}
+
+#[repr(C)]
+pub struct EfiGop {
+    pub query_mode: usize,
+    pub set_mode: usize,
+    pub blt: usize,
+    pub mode: *mut EfiGopMode,
+}
 
 pub const EFI_FILE_MODE_READ: u64 = 0x0000_0000_0000_0001;
 pub const EFI_LOADER_CODE: u32 = 3;
@@ -717,6 +759,53 @@ fn ensure_subtable(
     Ok(new)
 }
 
+/// Localiza o GOP via LocateProtocol e extrai `FramebufferInfo`. Retorna
+/// `None` se firmware nao expoe GOP ou o pixel format nao for de 32 bpp
+/// linear (RGB/BGR reservado). Renderer kernel-side nao lida com
+/// PixelBitMask/BltOnly.
+fn locate_framebuffer(bs: NonNull<EfiBootServices>) -> Option<FramebufferInfo> {
+    let mut iface: *mut c_void = core::ptr::null_mut();
+    // SAFETY: assinatura estavel UEFI 1.10+; passamos GUID valido,
+    // registration NULL (sem evento), e ponteiro out valido.
+    let st = unsafe {
+        (bs.as_ref().locate_protocol)(
+            &EFI_GOP_GUID as *const Guid,
+            core::ptr::null_mut(),
+            &mut iface as *mut *mut c_void,
+        )
+    };
+    if !status_success(st) || iface.is_null() {
+        return None;
+    }
+    // SAFETY: firmware devolveu interface valida ate ExitBootServices.
+    // `mode` e `info` sao ponteiros mantidos pelo driver GOP.
+    let (base, width, height, pitch, format) = unsafe {
+        let gop = &*(iface as *const EfiGop);
+        if gop.mode.is_null() {
+            return None;
+        }
+        let mode = &*gop.mode;
+        if mode.info.is_null() {
+            return None;
+        }
+        let info = &*mode.info;
+        (
+            mode.framebuffer_base,
+            info.horizontal_resolution,
+            info.vertical_resolution,
+            info.pixels_per_scan_line.saturating_mul(4),
+            info.pixel_format,
+        )
+    };
+    // PixelRedGreenBlueReserved8BitPerColor=0, PixelBlueGreenRedReserved=1.
+    // Outros formatos (BitMask=2, BltOnly=3) exigem decodificacao adicional
+    // que o renderer minimo do kernel nao implementa.
+    if format > 1 || base == 0 || width == 0 || height == 0 || pitch == 0 {
+        return None;
+    }
+    Some(FramebufferInfo { base, width, height, pitch, bpp: 32 })
+}
+
 /// Aborta o boot logando a causa pelo serial e entrando em loop. Usada para
 /// substituir `expect`/`unwrap` no caminho crítico: o firmware já saiu ou vai
 /// falhar ao retornar, então a única informação útil é a mensagem no serial.
@@ -789,6 +878,11 @@ pub extern "efiapi" fn efi_entry(image: EfiHandle, system_table: *mut EfiSystemT
     // ExitBootServices (qualquer allocate_pool/pages invalida o map_key).
     // Por isso augmentamos o PML4 UEFI PRIMEIRO (aloca PDPT/PD/PT para
     // higher-half) e so depois capturamos a memory map final.
+    // Coletado ANTES de map_kernel_higher_half: LocateProtocol e read-only,
+    // mas mantemos a janela curta por seguranca. None = sem GOP (kernel
+    // continua, somente sem feedback visual).
+    let fb_info = locate_framebuffer(bs);
+
     if map_kernel_higher_half(bs, kernel_phys).is_err() {
         bail("[boot] erro: falha ao mapear kernel higher-half\n");
     }
@@ -835,7 +929,7 @@ pub extern "efiapi" fn efi_entry(image: EfiHandle, system_table: *mut EfiSystemT
     // A partir daqui: APENAS operacoes sem efeito em memoria/firmware.
     // `build_bootinfo` e pura (so compoe bytes); `serial::write_str`
     // escreve em portas I/O, nao aloca.
-    let bootinfo = build_bootinfo(mem_map, None, None, None, kernel_phys);
+    let bootinfo = build_bootinfo(mem_map, fb_info, None, None, kernel_phys);
 
     serial::write_str("[boot] ExitBootServices\n");
     // SAFETY: chamada UEFI terminal; `map_key` foi obtido na última GetMemoryMap.
