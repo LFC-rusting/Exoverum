@@ -18,6 +18,10 @@ pub mod arch;
 pub mod log;
 #[cfg(target_os = "none")]
 pub mod kmain;
+// Renderer minimo do framebuffer UEFI. Bare-metal-only (depende de
+// mm::map_kernel_page e Perm::Mmio).
+#[cfg(target_os = "none")]
+pub mod fb;
 
 // `mm` e target-agnostico (logica pura; so manipula bytes), entao
 // pode ser compilado e testado em host.
