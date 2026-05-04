@@ -270,6 +270,9 @@ extern "sysv64" fn syscall_dispatch(ctx: *mut UserContext) {
             ctx_ref.rax = 0;
         }
         1 => {
+            // [bare metal] pipeline completo: ring 3 -> kernel -> halt.
+            // 5 linhas na tela + "Ns" = boot 100% validado em hardware.
+            crate::fb::mark_halt();
             log::write_str("[kernel] ring 3 exit; halting\n");
             cpu::halt_forever();
         }
