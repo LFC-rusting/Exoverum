@@ -63,13 +63,25 @@ works today; UDFs, wakeup predicates and software regions are
 
 The exokernel is **architecturally complete**. All eight phases of
 the roadmap are merged. Hard code budget: total Rust source stays
-at **≤ 4.5k Lines of Code**. Current footprint is:
+at **≤ 4.2k Lines of Code**. Current footprint is:
 
 | Artifact | LoC |
 |---|---|
-| Bootloader | ~1.1k LoC |
-| Kernel | ~2.6k LoC |
-| Crates | ~60 LoC |
+| Bootloader | 1228 LoC |
+| Kernel | 2821 LoC |
+| Crates (bootinfo) | 58 LoC |
+| **Total** | **4107 LoC** |
+
+Of this footprint, the following lines exist only as scaffolding —
+removing them yields a kernel that still boots to halt:
+
+| Non-essential | LoC (estimated) |
+|---|---|
+| Host tests (cap=567, frame=304, paging=193, sha256=165, bootinfo=58, elf=183) | ~1470 |
+| Demo userland (`kernel/src/arch/x86_64/userland.rs`) | ~210 |
+| Demo functions in `kmain.rs` (`demo_userland`, `demo_caps`, `demo_physmap`, `demo_alloc_free`, helpers) | ~209 |
+| Bare-metal visual feedback (`kernel/src/fb.rs`) | ~167 |
+| **Total non-essential (estimated)** | **~2056** |
 
 Host test suite:
 **65 tests, all passing** (51 kernel + 10 bootloader + 4 bootinfo).
@@ -428,6 +440,30 @@ sudo dd if=target/exoverum.img of=/dev/sdX bs=4M status=progress conv=fsync
 In every case the firmware looks for `/EFI/BOOT/BOOTX64.EFI`,
 which is exactly where the build places the bootloader. No
 bootloader configuration, no GRUB, no NVRAM entry needed.
+
+### Bare-metal visual feedback
+
+On real hardware the serial port is rarely wired. To make the same
+boot validation visible without a serial cable, the kernel renders
+five fixed text lines directly to the UEFI GOP framebuffer
+(`kernel/src/fb.rs`, 167 LoC, optional and removable):
+
+```text
+[OK] Bootloader.
+[OK] Paging.
+[OK] Caps.
+[OK] Userland.
+[OK] Halt.
+```
+
+Each line corresponds to a `fb::mark()` call at the same point as
+the matching serial log. Five lines on screen confirms that the entire
+pipeline (UEFI handoff → paging W^X → capabilities/CDT → ring 3 → syscall
+exit → halt) executed end-to-end on the real CPU.
+
+If the firmware does not expose a 32-bpp linear GOP framebuffer
+the visual feedback is silently skipped; the kernel itself runs
+identically and the serial trace remains the canonical proof.
 
 ## What the in-tree demo exercises
 
