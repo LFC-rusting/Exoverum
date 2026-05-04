@@ -10,6 +10,7 @@ use bootinfo::BootInfo;
 use crate::arch::x86_64::{cpu, gdt, idt, userland};
 use crate::cap::{CapObject, CapRights, CapTable};
 use crate::domain;
+use crate::fb;
 use crate::log;
 use crate::mm::{self, Perm};
 
@@ -47,6 +48,11 @@ pub unsafe fn start(bootinfo: *const BootInfo) -> ! {
     // ponteiro aponta para BootInfo valido em memoria LoaderData preservada.
     // Acesso apenas de leitura nesta funcao.
     let bi: &BootInfo = unsafe { &*bootinfo };
+
+    // Snapshot do FramebufferInfo: o BootInfo vive em lower-half UEFI e
+    // some apos `mm::init_paging`. `fb::mark` so passa a desenhar de
+    // verdade depois de `fb::remap_after_paging` (mais abaixo).
+    fb::init_from_bootinfo(bi);
 
     // Diagnostico: loga valores crus da MemoryMap para confirmar que o
     // bootloader preencheu corretamente antes de parsear.
@@ -96,6 +102,13 @@ pub unsafe fn start(bootinfo: *const BootInfo) -> ! {
         }
     }
 
+    // Mapeia o framebuffer em VA higher-half (Mmio: uncacheable + NX).
+    // A partir daqui, cada `fb::mark(N)` desenha 1 barra na tela em
+    // bare metal. Falha = no-op (kernel continua usando serial).
+    // SAFETY: `init_paging` completou; chamada unica por boot.
+    let _ = unsafe { fb::remap_after_paging() };
+    fb::mark(0); // [bare metal] paging + framebuffer ok
+
     // Fase 3d: prova que physmap esta ativo e que map_kernel_page consegue
     // materializar novas paginas POS-init_paging (pre-requisito da Fase 5).
     demo_physmap();
@@ -103,6 +116,7 @@ pub unsafe fn start(bootinfo: *const BootInfo) -> ! {
     // Fase 4: capabilities flat-table com CDT. Demo: mint raiz, deriva
     // subregioes, revoga e confirma que todos os descendentes sumiram.
     demo_caps();
+    fb::mark(1); // [bare metal] capabilities + revoke ok
 
     // Smoke test ring 3 multi-dominio: dominios com CR3+CSpace
     // proprios, cap_grant entre dominios, PCT (domain_call/reply),
@@ -185,6 +199,7 @@ fn demo_userland() -> ! {
     userland::install();
 
     log::write_str("[kernel] demo_userland: enter A\n");
+    fb::mark(2); // [bare metal] prestes a entrar ring 3
     let user_rsp = STACK_VA + 0x1000;
     // SAFETY: dh_a valido; payload e stack mapeados; RSP0 ok; IDT pronta.
     let _ = unsafe { domain::enter(dh_a, PAYLOAD_VA, user_rsp) };
