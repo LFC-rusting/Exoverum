@@ -68,9 +68,9 @@ at **≤ 4.5k Lines of Code**. Current footprint is:
 | Artifact | LoC |
 |---|---|
 | Bootloader | 1228 LoC |
-| Kernel | 3180 LoC |
+| Kernel | 3185 LoC |
 | Crates (bootinfo) | 58 LoC |
-| **Total** | **4466 LoC** |
+| **Total** | **4471 LoC** |
 
 Of this footprint, the following lines exist only as scaffolding —
 removing them yields a kernel that still boots to halt:
