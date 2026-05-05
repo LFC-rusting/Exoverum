@@ -72,6 +72,16 @@ pub enum CapObject {
     /// Dominio ring 3 (Phase 7a.4). `handle` e indice em `domain::DOMAINS`.
     /// Cap concede direito de invocar o dominio via PCT (`domain_call`).
     Domain { handle: u8 },
+    /// Notification object (Phase 4 extension, seL4-style). `handle` indexa
+    /// `crate::notification::SLOTS`. Signalword u64 atomico: `signal` faz
+    /// `fetch_or` (requer WRITE), `poll` faz `swap(0)` (requer READ).
+    /// Mecanismo puro de evento assincrono; politica de reacao e LibOS.
+    Notification { handle: u8 },
+    /// Timer capability (Phase 5b reborn). Singleton no sistema: concede
+    /// direito de programar o LAPIC timer one-shot via syscall
+    /// `timer_arm_oneshot`. No disparo, kernel sinaliza a Notification
+    /// fornecida pelo chamador. Zero politica de scheduling no kernel.
+    Timer,
 }
 
 /// Slot da tabela. `Empty` e o estado livre.
@@ -380,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn insert_root_ocupa_slot() {
+    fn insert_root_occupies_slot() {
         let mut t = CapTable::new();
         assert!(t.insert_root(0, mk_untyped(0, 4096), CapRights::ALL).is_ok());
         assert_eq!(t.insert_root(0, mk_untyped(0, 4096), CapRights::ALL),
@@ -388,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn insert_root_fora_de_range() {
+    fn insert_root_out_of_range() {
         let mut t = CapTable::new();
         assert_eq!(
             t.insert_root(CAP_SLOTS as CapSlot, mk_untyped(0, 4096), CapRights::ALL),
@@ -397,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_atenua_direitos() {
+    fn copy_attenuates_rights() {
         let mut t = CapTable::new();
         t.insert_root(0, mk_untyped(0, 4096), CapRights::ALL).unwrap();
         t.copy(0, 1, CapRights::READ).unwrap();
@@ -406,7 +416,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_rejeita_direitos_excedentes() {
+    fn copy_rejects_exceeding_rights() {
         let mut t = CapTable::new();
         t.insert_root(0, mk_untyped(0, 4096), CapRights::READ).unwrap();
         assert_eq!(
@@ -416,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_com_filhos_falha() {
+    fn delete_with_children_fails() {
         let mut t = CapTable::new();
         t.insert_root(0, mk_untyped(0, 4096), CapRights::ALL).unwrap();
         t.copy(0, 1, CapRights::READ).unwrap();
@@ -424,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_folha_limpa_slot() {
+    fn delete_leaf_clears_slot() {
         let mut t = CapTable::new();
         t.insert_root(0, mk_untyped(0, 4096), CapRights::ALL).unwrap();
         t.copy(0, 1, CapRights::READ).unwrap();
@@ -435,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn revoke_apaga_todos_descendentes_mantem_raiz() {
+    fn revoke_deletes_all_descendants_keeps_root() {
         let mut t = CapTable::new();
         t.insert_root(0, mk_untyped(0, 8192), CapRights::ALL).unwrap();
         t.copy(0, 1, CapRights::READ).unwrap();
@@ -443,28 +453,28 @@ mod tests {
         t.copy(1, 3, CapRights::READ).unwrap();
         t.copy(3, 4, CapRights::READ).unwrap();
         t.revoke(0).unwrap();
-        assert!(t.lookup(0).is_ok(), "raiz deve sobreviver");
+        assert!(t.lookup(0).is_ok(), "root must survive");
         for s in [1u16, 2, 3, 4] {
-            assert_eq!(t.lookup(s), Err(CapError::SlotEmpty), "slot {} deveria estar vazio", s);
+            assert_eq!(t.lookup(s), Err(CapError::SlotEmpty), "slot {} should be empty", s);
         }
     }
 
     #[test]
-    fn revoke_em_subarvore_nao_apaga_irmaos() {
+    fn revoke_on_subtree_does_not_delete_siblings() {
         let mut t = CapTable::new();
         t.insert_root(0, mk_untyped(0, 8192), CapRights::ALL).unwrap();
-        t.copy(0, 1, CapRights::READ).unwrap(); // filho 1
-        t.copy(0, 2, CapRights::READ).unwrap(); // filho 2
-        t.copy(1, 3, CapRights::READ).unwrap(); // neto de 1
+        t.copy(0, 1, CapRights::READ).unwrap(); // child 1
+        t.copy(0, 2, CapRights::READ).unwrap(); // child 2
+        t.copy(1, 3, CapRights::READ).unwrap(); // grandchild of 1
         t.revoke(1).unwrap();
-        assert!(t.lookup(1).is_ok(), "alvo de revoke fica");
-        assert!(t.lookup(2).is_ok(), "irmao nao afetado");
-        assert_eq!(t.lookup(3), Err(CapError::SlotEmpty), "neto revogado");
+        assert!(t.lookup(1).is_ok(), "revoke target remains");
+        assert!(t.lookup(2).is_ok(), "sibling not affected");
+        assert_eq!(t.lookup(3), Err(CapError::SlotEmpty), "grandchild revoked");
     }
 
     #[test]
-    fn retype_respeita_offset_do_libos() {
-        // LibOS escolhe offset=0: filho fica em parent.base.
+    fn retype_respects_libos_offset() {
+        // LibOS chooses offset=0: child lies at parent.base.
         let mut t = CapTable::new();
         t.insert_root(0, mk_untyped(0x1000, 0x4000), CapRights::ALL).unwrap();
         t.retype_untyped(0, 1, 0, 0x1000).unwrap();
@@ -473,30 +483,30 @@ mod tests {
                 assert_eq!(base, 0x1000);
                 assert_eq!(size, 0x1000);
             }
-            _ => unreachable!("teste so cria Untyped"),
+            _ => unreachable!("test only creates Untyped"),
         }
     }
 
     #[test]
-    fn retype_irmaos_nao_aliasam_com_offsets_explicitos() {
+    fn retype_siblings_do_not_alias_with_explicit_offsets() {
         let mut t = CapTable::new();
         t.insert_root(0, mk_untyped(0x1000, 0x4000), CapRights::ALL).unwrap();
         t.retype_untyped(0, 1, 0x0000, 0x1000).unwrap(); // [0x1000,0x2000)
         t.retype_untyped(0, 2, 0x1000, 0x1000).unwrap(); // [0x2000,0x3000)
         let b1 = match t.lookup(1).unwrap().0 {
             CapObject::Untyped { base, .. } => base,
-            _ => unreachable!("teste so cria Untyped"),
+            _ => unreachable!("test only creates Untyped"),
         };
         let b2 = match t.lookup(2).unwrap().0 {
             CapObject::Untyped { base, .. } => base,
-            _ => unreachable!("teste so cria Untyped"),
+            _ => unreachable!("test only creates Untyped"),
         };
         assert_eq!(b1, 0x1000);
         assert_eq!(b2, 0x2000);
     }
 
     #[test]
-    fn retype_rejeita_overlap_entre_irmaos() {
+    fn retype_rejects_overlap_between_siblings() {
         // LibOS maliciosa tenta criar filho sobre regiao ja alocada.
         // Kernel DEVE rejeitar para nao permitir alias nao-rastreado.
         let mut t = CapTable::new();
@@ -515,7 +525,7 @@ mod tests {
     }
 
     #[test]
-    fn retype_estoura_parent_size() {
+    fn retype_exceeds_parent_size() {
         let mut t = CapTable::new();
         t.insert_root(0, mk_untyped(0x1000, 0x2000), CapRights::ALL).unwrap();
         assert_eq!(
@@ -526,7 +536,7 @@ mod tests {
     }
 
     #[test]
-    fn retype_zero_size_rejeitado() {
+    fn retype_zero_size_rejected() {
         let mut t = CapTable::new();
         t.insert_root(0, mk_untyped(0x1000, 0x4000), CapRights::ALL).unwrap();
         assert_eq!(
@@ -536,7 +546,7 @@ mod tests {
     }
 
     #[test]
-    fn retype_offset_overflow_rejeitado() {
+    fn retype_offset_overflow_rejected() {
         // Defesa contra overflow em offset+size.
         let mut t = CapTable::new();
         t.insert_root(0, mk_untyped(0x1000, 0x4000), CapRights::ALL).unwrap();
@@ -547,7 +557,7 @@ mod tests {
     }
 
     #[test]
-    fn revoke_libera_regiao_para_novo_retype() {
+    fn revoke_frees_region_for_new_retype() {
         let mut t = CapTable::new();
         t.insert_root(0, mk_untyped(0x1000, 0x4000), CapRights::ALL).unwrap();
         t.retype_untyped(0, 1, 0x0000, 0x2000).unwrap();
@@ -557,23 +567,23 @@ mod tests {
         t.retype_untyped(0, 1, 0, 0x1000).unwrap();
         match t.lookup(1).unwrap().0 {
             CapObject::Untyped { base, .. } => assert_eq!(base, 0x1000),
-            _ => unreachable!("teste so cria Untyped"),
+            _ => unreachable!("test only creates Untyped"),
         }
     }
 
     #[test]
-    fn retype_em_nao_untyped_rejeitado() {
+    fn retype_on_non_untyped_rejected() {
         let mut t = CapTable::new();
         t.insert_root(0, CapObject::Frame { phys: 0x1000 }, CapRights::ALL).unwrap();
         assert_eq!(
             t.retype_untyped(0, 1, 0, 0x1000),
             Err(CapError::WrongType),
-            "retype so funciona em Untyped"
+            "retype only works on Untyped"
         );
     }
 
     #[test]
-    fn revoke_profunda_nao_estoura_stack() {
+    fn deep_revoke_does_not_overflow_stack() {
         // Cadeia linear de 64 capabilities: 0 -> 1 -> 2 -> ... -> 63.
         // Exercita recursao em profundidade; se mudarmos para iterativo,
         // este teste continua servindo como sanidade de linearizacao.
@@ -589,13 +599,13 @@ mod tests {
     }
 
     #[test]
-    fn lookup_fora_de_range() {
+    fn lookup_out_of_range() {
         let t = CapTable::new();
         assert_eq!(t.lookup(CAP_SLOTS as CapSlot), Err(CapError::SlotOutOfRange));
     }
 
     #[test]
-    fn rights_atenuacao_transitiva() {
+    fn rights_attenuation_transitive() {
         // src(ALL) -> a(READ|WRITE) -> b(READ) - ok
         // tentar derivar b com WRITE a partir de a falharia? Sim: a nao tem
         // WRITE se atribuimos so READ. Verifica que a atenuacao acumula.
@@ -612,7 +622,7 @@ mod tests {
     // ---- Phase 8: testes adversariais ----
 
     #[test]
-    fn copy_de_slot_vazio_falha() {
+    fn copy_from_empty_slot_fails() {
         let mut t = CapTable::new();
         assert_eq!(
             t.copy(0, 1, CapRights::READ),
@@ -621,7 +631,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_src_igual_dst_rejeitado() {
+    fn copy_src_equal_dst_rejected() {
         let mut t = CapTable::new();
         t.insert_root(0, mk_untyped(0, 4096), CapRights::ALL).unwrap();
         // Aliasing src=dst e malicioso (cria loop na CDT). A API
@@ -633,13 +643,13 @@ mod tests {
     }
 
     #[test]
-    fn revoke_em_slot_vazio_falha() {
+    fn revoke_on_empty_slot_fails() {
         let mut t = CapTable::new();
         assert_eq!(t.revoke(0), Err(CapError::SlotEmpty));
     }
 
     #[test]
-    fn revoke_dupla_e_idempotente_apos_primeira() {
+    fn double_revoke_is_idempotent_after_first() {
         let mut t = CapTable::new();
         t.insert_root(0, mk_untyped(0, 4096), CapRights::ALL).unwrap();
         t.copy(0, 1, CapRights::READ).unwrap();
@@ -651,7 +661,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_fora_de_range() {
+    fn delete_out_of_range() {
         let mut t = CapTable::new();
         assert_eq!(
             t.delete(CAP_SLOTS as CapSlot),
@@ -660,7 +670,7 @@ mod tests {
     }
 
     #[test]
-    fn insert_frame_e_lookup() {
+    fn insert_frame_and_lookup() {
         let mut t = CapTable::new();
         t.insert_root(0, CapObject::Frame { phys: 0xdead_b000 }, CapRights::READ)
             .unwrap();
@@ -670,18 +680,18 @@ mod tests {
     }
 
     #[test]
-    fn insert_domain_e_lookup() {
+    fn insert_domain_and_lookup() {
         let mut t = CapTable::new();
         t.insert_root(0, CapObject::Domain { handle: 7 }, CapRights::ALL)
             .unwrap();
         match t.lookup(0).unwrap().0 {
             CapObject::Domain { handle } => assert_eq!(handle, 7),
-            _ => panic!("esperava Domain"),
+            _ => panic!("expected Domain"),
         }
     }
 
     #[test]
-    fn rights_contains_propriedades() {
+    fn rights_contains_properties() {
         // Reflexivo
         assert!(CapRights::ALL.contains(CapRights::ALL));
         assert!(CapRights::READ.contains(CapRights::READ));
@@ -698,7 +708,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_em_slot_ocupado_falha() {
+    fn copy_on_occupied_slot_fails() {
         let mut t = CapTable::new();
         t.insert_root(0, mk_untyped(0, 4096), CapRights::ALL).unwrap();
         t.insert_root(1, mk_untyped(0x2000, 4096), CapRights::ALL).unwrap();
@@ -709,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn retype_em_slot_dst_ocupado_falha() {
+    fn retype_on_occupied_dst_slot_fails() {
         let mut t = CapTable::new();
         t.insert_root(0, mk_untyped(0, 0x4000), CapRights::ALL).unwrap();
         t.insert_root(1, mk_untyped(0x10_0000, 0x1000), CapRights::ALL).unwrap();
@@ -720,15 +730,15 @@ mod tests {
     }
 
     #[test]
-    fn retype_em_filho_usa_base_do_filho() {
-        // Filho tem seu proprio espaco; neto fica em [filho.base + offset, ...).
+    fn retype_on_child_uses_child_base() {
+        // Child has its own space; grandchild lies at [child.base + offset, ...).
         let mut t = CapTable::new();
         t.insert_root(0, mk_untyped(0x0000, 0x8000), CapRights::ALL).unwrap();
-        t.retype_untyped(0, 1, 0x2000, 0x2000).unwrap(); // filho em [0x2000,0x4000)
-        t.retype_untyped(1, 2, 0, 0x1000).unwrap();      // neto em [0x2000,0x3000)
+        t.retype_untyped(0, 1, 0x2000, 0x2000).unwrap(); // child at [0x2000,0x4000)
+        t.retype_untyped(1, 2, 0, 0x1000).unwrap();      // grandchild at [0x2000,0x3000)
         match t.lookup(2).unwrap().0 {
             CapObject::Untyped { base, .. } => assert_eq!(base, 0x2000),
-            _ => unreachable!("teste so cria Untyped"),
+            _ => unreachable!("test only creates Untyped"),
         }
     }
 }
