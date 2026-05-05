@@ -52,7 +52,7 @@ the kernel implements each one.
 | 2 | **Expose allocation** | strict | `retype_untyped(src, dst, offset, size)` — the LibOS chooses *both* the offset inside the parent and the size; the kernel only checks bounds and sibling non-overlap. No watermark, no kernel policy on placement |
 | 3 | **Expose names** | strict | capabilities carry physical addresses (`Frame{phys}`, `Untyped{base, size}`) and dense numeric handles (`Domain{handle}`); no virtual translations |
 | 4 | **Expose revocation** | strict | `revoke` (local CDT) and `revoke_granted` (cross-CSpace) atomically remove every derived capability. Affected domains discover the loss *synchronously* on their next invocation of the now-empty slot (`lookup` returns `SlotEmpty`). No upcall is imposed by the kernel — detection and response are LibOS policy |
-| 5 | **Expose information** | minimal by design | the kernel keeps its read-only data structures small; LibOS-visible counters (free frames, ticks) are added only when a real LibOS asks for them |
+| 5 | **Expose information** | strict | events delivered via `Notification` (u64 signalword, `poll_notify` reads+clears); LAPIC timer fires route to a LibOS-chosen Notification bit. LibOS learns of elapsed time, revoked grants and any other event by polling; no kernel-imposed upcall |
 
 Kaashoek–1997 §3.3 (*protected sharing*) is covered by `cap_grant` plus
 the monotonic rights attenuation invariant. Mutual-trust sharing
@@ -63,28 +63,28 @@ works today; UDFs, wakeup predicates and software regions are
 
 The exokernel is **architecturally complete**. All eight phases of
 the roadmap are merged. Hard code budget: total Rust source stays
-at **≤ 4.2k Lines of Code**. Current footprint is:
+at **≤ 4.5k Lines of Code**. Current footprint is:
 
 | Artifact | LoC |
 |---|---|
 | Bootloader | 1228 LoC |
-| Kernel | 2821 LoC |
+| Kernel | 3180 LoC |
 | Crates (bootinfo) | 58 LoC |
-| **Total** | **4107 LoC** |
+| **Total** | **4466 LoC** |
 
 Of this footprint, the following lines exist only as scaffolding —
 removing them yields a kernel that still boots to halt:
 
-| Non-essential | LoC (estimated) |
+| Non-essential | LoC |
 |---|---|
-| Host tests (cap=567, frame=304, paging=193, sha256=165, bootinfo=58, elf=183) | ~1470 |
-| Demo userland (`kernel/src/arch/x86_64/userland.rs`) | ~210 |
-| Demo functions in `kmain.rs` (`demo_userland`, `demo_caps`, `demo_physmap`, `demo_alloc_free`, helpers) | ~209 |
-| Bare-metal visual feedback (`kernel/src/fb.rs`) | ~167 |
-| **Total non-essential (estimated)** | **~2056** |
+| Host tests (cap=567, frame=304, paging=193, sha256=165, bootinfo=58, elf=183, notification=100, timer=119) | 1689 |
+| Demo userland (`kernel/src/arch/x86_64/userland.rs`) | 235 |
+| Demo functions in `kmain.rs` (demo_userland, setup_domain, fail, demo_caps, demo_physmap, log_frame_stats, demo_alloc_free) | 179 |
+| Bare-metal visual feedback (`kernel/src/fb.rs`) | 167 |
+| **Total non-essential** | **2270** |
 
 Host test suite:
-**65 tests, all passing** (51 kernel + 10 bootloader + 4 bootinfo).
+**77 tests, all passing** (63 kernel + 10 bootloader + 4 bootinfo).
 
 Phases below summarize what each milestone delivered. Every phase
 delivers only *mechanism*; schedulers, IPC protocols, file systems
@@ -99,6 +99,16 @@ and any other abstraction live in user-space LibOSes (Engler–1995
 - **Phase 2 — physical memory.** Bitmap frame allocator built from
   the firmware memory map, with the first 1 MiB unconditionally reserved.
 
+  > **On "expose allocation" compliance.** The bitmap lives *inside*
+  > the kernel but is only ever touched by kernel bootstrap code
+  > (paging setup, framebuffer MMIO map, demos). No syscall exposes
+  > `alloc_frame` to ring 3. LibOSes acquire memory exclusively through
+  > `retype_untyped(src, dst, offset, size)` where the LibOS chooses
+  > both offset and size; the kernel only audits bounds and sibling
+  > non-overlap. This satisfies Kaashoek-1997 §3.1 principle #2:
+  > allocation *policy* is exposed (LibOS-chosen), internal ownership
+  > tracking (the bitmap) is implementation detail.
+
 - **Phase 3 — paging.** The kernel builds its own higher-half page
   tables with **W^X enforced per section**, drops the firmware identity
   map, and exposes a direct-map view of physical RAM so any frame can be
@@ -111,12 +121,24 @@ and any other abstraction live in user-space LibOSes (Engler–1995
   Capability Derivation Tree for **global revoke**: revoking any
   capability atomically invalidates every derivation descending from it,
   across every process. Per-cap rights attenuation, retype from
-  `Untyped`, copy and delete are all in place.
+  `Untyped`, copy and delete are all in place. Five variants:
 
-  > The flat table is a deliberate v1. It can evolve to a CSpace graph
-  > (CNodes pointing to CNodes, seL4-style) later **without changing any
-  > public operation**, but that evolution is optional and may never
-  > happen — we'll switch only if a concrete need arises.
+  - `Untyped { base, size }` — raw physical region, retype-source.
+  - `Frame { phys }` — 4 KiB page, mappable via `domain::map`.
+  - `Domain { handle }` — ring-3 domain handle, authorizes `domain_call`.
+  - `Notification { handle }` — seL4-style u64 signalword
+    (`signal`=`fetch_or` requires WRITE, `poll`=`swap(0)` requires READ).
+    Minimal async event mechanism; policy (poll vs block vs IPC-wrap)
+    stays in LibOS.
+  - `Timer` — singleton capability to arm LAPIC one-shot; delivers via
+    a caller-provided `Notification` bit (see Phase 5b).
+
+  > The flat table is a deliberate v1, not technical debt. It can evolve
+  > to a CSpace graph (CNodes pointing to CNodes, seL4-style) later
+  > **without changing any public operation**, but that evolution is
+  > optional and may never happen — current CSpaces are 256 fixed slots
+  > per domain with no sharing/dedup pressure. KISS until a concrete
+  > need arises.
 
 - **Phase 5a — Thread Control Blocks & cooperative yield.** The
   Thread Control Block (the *kernel object*, not to be confused with TCB
@@ -129,14 +151,37 @@ and any other abstraction live in user-space LibOSes (Engler–1995
   priority, EDF, lottery, gang scheduling, all of it lives in the LibOS.
   Different LibOSes can run incompatible policies side-by-side.
 
-- **Phase 5b — (removed).** An earlier milestone wired up the local
-  APIC with a one-shot timer and a stub handler that logged ticks,
-  intended to later carry preemptive upcalls into ring 3. It was
-  **removed from the kernel**: a timer is *policy* ("how often should
-  a LibOS be preempted?"), not mechanism. A future LibOS that wants
-  preemption receives the LAPIC as a capability and programs it
-  itself. The kernel currently configures no hardware interrupt
-  source; ring 3 runs until it issues a voluntary syscall or faults.
+- **Phase 5b — Timer capability.** An earlier draft wired up the
+  LAPIC as kernel policy (always-on preemptive tick) and was
+  removed. The current implementation exposes the LAPIC one-shot
+  timer as a **capability**, not kernel policy:
+
+  - `CapObject::Timer` is a singleton cap. Whoever holds it (with
+    `WRITE` rights) may arm the hardware one-shot via syscall
+    `timer_arm_oneshot(timer_slot, ticks, notif_slot, bits)`.
+  - At fire time, the kernel's IRQ handler (vector 0x40) runs
+    `timer::fire`, which signals the caller-provided `Notification`
+    with `bits` via `notification::signal`, then EOIs the LAPIC.
+    The handler does **not** switch domains, does **not** deliver an
+    upcall, and does **not** make any scheduling decision.
+  - The notified LibOS discovers the event on its next
+    `poll_notify` (syscall 5). **When** to poll, **whether** to yield,
+    and **which** domain runs next are all LibOS policy.
+
+  This matches Engler-1995 §3.3 (expose events) + Kaashoek-1997 §3.1
+  principle #5 (expose information): the timer *mechanism* (Initial
+  Count, EOI, IRQ routing) is in the kernel; the *policy* (how often,
+  what to do) is in ring 3. `arch::x86_64::lapic` holds all LAPIC
+  unsafe MMIO; `timer` is a tiny target-agnostic callback shim
+  (`#![forbid(unsafe_code)]`, host-testable).
+
+  **What this does not solve.** Exoverum still has no scheduler: a
+  ring-3 loop that neither polls its notification nor voluntarily
+  calls another domain will monopolize the CPU, because the kernel
+  does not force-switch on timer IRQ. That's deliberate — force-
+  switching requires picking a next domain, i.e. policy. A future
+  scheduler LibOS can hold the Timer cap, arm a periodic tick, and
+  implement preemption in user-space via `domain_call`.
 
 - **Phase 6 — Cooperative scaffolding** (subsumed by Phase 7b). The
   cooperative thread + single-bit event primitives that exercised
@@ -184,13 +229,28 @@ and any other abstraction live in user-space LibOSes (Engler–1995
       from the kernel. Whoever runs in ring 3 implements its own
       threads and synchronization on top of PCT.
 
+    - **`notify` / `poll_notify`** — syscalls 4 and 5, validated by
+      `CapObject::Notification` in the caller's CSpace. `notify`
+      (`WRITE`) does `signalword |= bits` via `fetch_or`;
+      `poll_notify` (`READ`) does `swap(0)`. This is the minimal
+      async-event mechanism (seL4-style). Cross-domain signalling:
+      domain A `cap_grant`s a Notification cap to domain B; A polls,
+      B signals. Handle space is a small static pool
+      (`notification::MAX_NOTIFICATIONS = 16`).
+    - **`timer_arm_oneshot`** — syscall 6. Takes a `Timer` cap + a
+      `Notification` cap + tick count + bit mask. Programs LAPIC
+      Initial Count; on fire, the kernel signals the notification.
+      Complete description in Phase 5b.
+
     **No kernel-imposed upcall mechanism.** Earlier drafts shipped an
     `upcall_entry`/`upcall_stack` pair per domain plus a fifth syscall
-    (`upcall_return`) so the kernel could preempt a LibOS to deliver
-    timer ticks or revocation notifications. That was **removed**:
-    *when and how* a LibOS should be notified of an event is policy,
-    not mechanism. The kernel now only has four syscalls (0–3), and
-    any notification machinery lives entirely in ring 3.
+    (`upcall_return`) so the kernel could preempt a LibOS and deliver
+    timer ticks or revocation notifications from ring 0. That was
+    **removed**: *when and how* a LibOS should be notified is policy,
+    not mechanism. Notifications are pull-based (poll) with an opt-in
+    hardware-signal path (timer IRQ → kernel bit set → LibOS polls).
+    The seven syscalls (0–6) expose only primitive mechanisms; every
+    higher-level abstraction lives in ring 3.
 
   The kernel guarantees only capability validation, domain isolation
   and correct context switch. Message formats, buffering, scheduling
@@ -228,22 +288,28 @@ and any other abstraction live in user-space LibOSes (Engler–1995
     path.
   - **Tech debt cleanup.** `CapObject::Thread` and `CapObject::Event`
     — dead since Phase 7b removed the scaffolding — are gone from
-    `cap.rs`. The capability enum now has only the three live
-    variants: `Untyped`, `Frame`, `Domain`. The APIC timer module and
-    the upcall machinery are likewise gone.
+    `cap.rs`. The upcall machinery (`upcall_entry`/`upcall_stack` +
+    `upcall_return` syscall) is gone. The capability enum now has
+    five live variants: `Untyped`, `Frame`, `Domain`, `Notification`,
+    `Timer` (the last two added by Phase 4/5b re-scoping described
+    above, as mechanism-only capabilities).
   - **Adversarial host tests.** `cap::tests` covers `copy` from
     empty/aliased slots, double `revoke`, out-of-range `delete`,
     `Frame`/`Domain` round-trips, `CapRights::contains` algebraic
     properties, sibling-overlap rejection on retype, and offset
-    overflow defense. Total: **65 host tests, all passing**
-    (51 kernel + 10 bootloader + 4 bootinfo).
+    overflow defense. `notification::tests` and `timer::tests` cover
+    signal/poll reset semantics, idempotence and callback overwrite.
+    Total: **77 host tests, all passing** (63 kernel + 10 bootloader
+    + 4 bootinfo).
 
-  **Out of scope, deferred to LibOS work** (not the kernel): async
-  PCT (one-way `domain_send`), preemptive scheduling policy, any
-  notification protocol on top of revocation (timer ticks,
-  repossession callbacks, fault forwarding). These are *policy* in
-  the Engler-1995 sense and cannot live in an exokernel; whoever
-  needs them implements them in ring 3.
+  **Out of scope, deferred to LibOS work** (not the kernel):
+  preemptive scheduling *policy* (who runs next on timer fire),
+  async PCT (one-way `domain_send`), periodic timers built on top of
+  one-shot, fairness, priority, any IPC protocol richer than PCT,
+  file systems, POSIX, names. These are *policy* in the Engler-1995
+  sense and cannot live in an exokernel. Note: timer and
+  notification *mechanisms* are delivered (Phase 5b + Phase 4
+  extension); only the *policy* of how to react to them is deferred.
 
   **At the end of Phase 8 the exokernel is complete.** No LibOS is
   required for the kernel to boot, validate every Phase 7 + Phase 8
@@ -265,19 +331,22 @@ bootloader/             UEFI PE binary
   src/crypto/sha256.rs  SHA-256 (pure safe Rust)
 kernel/                 Bare-metal ELF binary
   src/main.rs           kernel_start (extern "sysv64") shim
-  src/lib.rs            library (host-testable)
-  src/kmain.rs          phased init
-  src/log.rs, panic.rs  logging + panic
-  src/arch/x86_64/      cpu / gdt / idt / serial (unsafe isolated)
+  src/lib.rs            library root + panic handler (host-testable modules)
+  src/kmain.rs          phased init (demo_userland, demo_caps, demo_physmap)
+  src/fb.rs             framebuffer renderer (bare-metal only)
+  src/arch/x86_64/      cpu / gdt / idt / serial / lapic / userland
+                        (unsafe isolated here; only asm/MMIO/MSR lives below)
   src/mm/               frame, paging (+ unsafe boundary in mod.rs)
-  src/cap.rs            capabilities flat-table + CDT + local revoke + host tests
-                        (retype with LibOS-chosen offset, sibling-overlap check)
-  src/domain.rs         Domain (CR3 + CSpace + saved_ctx + aborted) +
-                        PCT + cap_grant + GRANTS + synchronous revoke_granted +
-                        abort_current
-  src/arch/x86_64/idt.rs       IDT + fault_dispatch (CPL split + abort)
-  src/arch/x86_64/userland.rs  ring-3 entry/exit + UserContext save/restore +
-                               syscall dispatch (4 calls: nop, exit, call, reply)
+  src/kobj/             kernel objects (host-testable, except domain)
+    cap.rs              capabilities flat-table + CDT + local revoke + host tests
+                        variants: Untyped, Frame, Domain, Notification, Timer
+    notification.rs     seL4-style async signalling: u64 signalword pool,
+                        signal/poll/create/destroy; atomic, host-testable
+    timer.rs            Timer callback shim: arms LAPIC, delivers on fire
+                        via notification::signal (safe Rust, host-testable)
+    domain.rs           Domain (CR3 + CSpace + saved_ctx + aborted) +
+                        PCT + cap_grant + GRANTS + synchronous revoke_granted
+                        + abort_current + notify/poll_notify/arm_timer helpers
   linker.ld             kernel layout (VMA 0xFFFFFFFF80200000, LMA 0x200000)
 ```
 
@@ -386,6 +455,7 @@ The `make run` (or the equivalent QEMU invocation above) produces:
 [kernel] alloc frame @ 0x00000000001XXXXX   <-- always >= 1 MiB
 [kernel] frame freed; free: N
 [kernel] paging active; cr3=0x...           <-- higher-half PML4
+[kernel] lapic ok                            <-- MMIO mapped, enabled, timer masked
 [kernel] physmap ok: map+physmap views coherent
 [kernel] cap root + 3 descendants created
 [kernel] global revoke ok; root intact
