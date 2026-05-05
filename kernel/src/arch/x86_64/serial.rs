@@ -73,3 +73,32 @@ pub fn write_str(s: &str) {
         write_byte(b);
     }
 }
+
+/// Escreve um `u64` como 16 digitos hex (zero-padded, sem prefixo).
+/// Caller imprime "0x" antes se quiser.
+pub fn write_hex64(n: u64) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for i in (0..16).rev() {
+        let nibble = ((n >> (i * 4)) & 0xF) as usize;
+        write_byte(HEX[nibble]);
+    }
+}
+
+/// Escreve um `usize` em decimal. Sem `core::fmt`.
+pub fn write_usize(mut n: usize) {
+    if n == 0 {
+        write_byte(b'0');
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut i = 0;
+    while n > 0 {
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        i += 1;
+    }
+    while i > 0 {
+        i -= 1;
+        write_byte(buf[i]);
+    }
+}
