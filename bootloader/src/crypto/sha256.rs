@@ -34,7 +34,7 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     // deve ser comprimido (requisito FIPS 180-4).
     let bit_len = (data.len() as u64)
         .checked_mul(8)
-        .expect("Input data too long: maximum 2^61 - 1 bytes (2^64 - 1 bits)");
+        .expect("Input too long: exceeds SHA-256 limit (2^64-1 bits)");
     let mut buffer = [0u8; 64];
     let mut h = H0;
 
@@ -146,35 +146,35 @@ mod tests {
     }
 
     #[test]
-    fn vetor_empty() {
+    fn vector_empty() {
         let h = sha256(b"");
-        let esperado = b"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-        assert_eq!(&hex(&h), esperado);
+        let expected = b"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        assert_eq!(&hex(&h), expected);
     }
 
     #[test]
-    fn vetor_abc() {
+    fn vector_abc() {
         let h = sha256(b"abc");
-        let esperado = b"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
-        assert_eq!(&hex(&h), esperado);
+        let expected = b"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert_eq!(&hex(&h), expected);
     }
 
     #[test]
-    fn vetor_exato_64_bytes() {
+    fn vector_exact_64_bytes() {
         // Caso-limite: input exato de 1 bloco exige um bloco extra só de padding.
         let data = [b'a'; 64];
         let h = sha256(&data);
-        let esperado = b"ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb";
-        assert_eq!(&hex(&h), esperado);
+        let expected = b"ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb";
+        assert_eq!(&hex(&h), expected);
     }
 
     #[test]
-    fn vetor_56_bytes() {
+    fn vector_56_bytes() {
         // Exatamente 56 bytes força o caso de padding que precisa de 2 blocos.
         let data = b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
         let h = sha256(data);
-        let esperado = b"248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1";
-        assert_eq!(&hex(&h), esperado);
+        let expected = b"248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1";
+        assert_eq!(&hex(&h), expected);
     }
 
     // Vetores NIST FIPS 180-4 adicionais para endurecer a confiança.
@@ -182,28 +182,28 @@ mod tests {
     // caso longo canônico de 1 milhão de 'a' (multiplos blocos cheios + padding).
 
     #[test]
-    fn vetor_um_byte() {
+    fn vector_one_byte() {
         let h = sha256(b"a");
-        let esperado = b"ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb";
-        assert_eq!(&hex(&h), esperado);
+        let expected = b"ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb";
+        assert_eq!(&hex(&h), expected);
     }
 
     #[test]
-    fn vetor_112_bytes_dois_blocos() {
+    fn vector_112_bytes_two_blocks() {
         let data = b"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
         assert_eq!(data.len(), 112);
         let h = sha256(data);
-        let esperado = b"cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1";
-        assert_eq!(&hex(&h), esperado);
+        let expected = b"cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1";
+        assert_eq!(&hex(&h), expected);
     }
 
     #[test]
-    fn vetor_um_milhao_de_a() {
+    fn vector_one_million_a() {
         // Caso canônico NIST: 1_000_000 bytes 'a'. Exercita muitas iterações
         // do laço de blocos cheios e detecta qualquer drift no offset/length.
         let data = [b'a'; 1_000_000];
         let h = sha256(&data);
-        let esperado = b"cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0";
-        assert_eq!(&hex(&h), esperado);
+        let expected = b"cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0";
+        assert_eq!(&hex(&h), expected);
     }
 }
