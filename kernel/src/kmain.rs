@@ -7,12 +7,15 @@
 
 use bootinfo::BootInfo;
 
-use crate::arch::x86_64::{cpu, gdt, idt, userland};
-use crate::cap::{CapObject, CapRights, CapTable};
-use crate::domain;
+use crate::arch::x86_64::{cpu, gdt, idt, lapic, serial, userland};
 use crate::fb;
-use crate::log;
+use crate::kobj::cap::{CapError, CapObject, CapRights, CapTable};
+use crate::kobj::domain;
 use crate::mm::{self, Perm};
+
+// Atalho: saida de texto do kernel = serial COM1. Reexportado em
+// escopo local para manter chamadas curtas (`log::write_str(...)`).
+use crate::arch::x86_64::serial as log;
 
 /// Entry point chamado pelo binario (`src/main.rs`).
 ///
@@ -30,7 +33,7 @@ use crate::mm::{self, Perm};
 /// alocador). Por isso a funcao e `unsafe fn` apesar da deref ser a unica
 /// op unsafe visivel no corpo.
 pub unsafe fn start(bootinfo: *const BootInfo) -> ! {
-    log::init();
+    serial::init();
     log::write_str("[kernel] hello\n");
 
     if bootinfo.is_null() {
@@ -57,11 +60,11 @@ pub unsafe fn start(bootinfo: *const BootInfo) -> ! {
     // Diagnostico: loga valores crus da MemoryMap para confirmar que o
     // bootloader preencheu corretamente antes de parsear.
     log::write_str("[kernel] mm.ptr=0x");
-    log_u64_hex(bi.memory_map.ptr);
+    serial::write_hex64(bi.memory_map.ptr);
     log::write_str(" len=");
-    log_usize(bi.memory_map.len as usize);
+    serial::write_usize(bi.memory_map.len as usize);
     log::write_str(" desc_size=");
-    log_usize(bi.memory_map.desc_size as usize);
+    serial::write_usize(bi.memory_map.desc_size as usize);
     log::write_str("\n");
 
     match mm::init(bi) {
@@ -89,7 +92,7 @@ pub unsafe fn start(bootinfo: *const BootInfo) -> ! {
     match unsafe { mm::init_paging() } {
         Ok(pml4) => {
             log::write_str("[kernel] paging active; cr3=0x");
-            log_u64_hex(pml4);
+            serial::write_hex64(pml4);
             log::write_str("\n");
         }
         Err(mm::PagingError::OutOfFrames) => {
@@ -108,6 +111,15 @@ pub unsafe fn start(bootinfo: *const BootInfo) -> ! {
     // SAFETY: `init_paging` completou; chamada unica por boot.
     let _ = unsafe { fb::remap_after_paging() };
     fb::mark(0); // [bare metal] paging + framebuffer ok
+
+    // Phase 5b (reborn): LAPIC init. Mapeia MMIO, habilita, mascara
+    // timer. LibOS com cap Timer pode armar one-shot via syscall 6.
+    // Kernel nao arma por si; politica fica em ring 3.
+    // SAFETY: pos-init_paging; chamada unica por boot.
+    match unsafe { lapic::init() } {
+        Ok(()) => log::write_str("[kernel] lapic ok\n"),
+        Err(_) => log::write_str("[kernel] lapic init err (continuing)\n"),
+    }
 
     // Fase 3d: prova que physmap esta ativo e que map_kernel_page consegue
     // materializar novas paginas POS-init_paging (pre-requisito da Fase 5).
@@ -153,11 +165,11 @@ fn demo_userland() -> ! {
 
     let dh_a = match unsafe { domain::create() } {
         Ok(h) => h,
-        Err(_) => fail("demo_userland: domain::create A falhou"),
+        Err(_) => fail("demo_userland: domain::create A failed"),
     };
     let dh_b = match unsafe { domain::create() } {
         Ok(h) => h,
-        Err(_) => fail("demo_userland: domain::create B falhou"),
+        Err(_) => fail("demo_userland: domain::create B failed"),
     };
 
     setup_domain(dh_b, userland::payload_b_bytes(), None, PAYLOAD_VA, STACK_VA);
@@ -179,11 +191,11 @@ fn demo_userland() -> ! {
     )
     .is_err()
     {
-        fail("demo_userland: insert Domain{B} cap em A falhou");
+        fail("demo_userland: insert Domain{B} cap into A failed");
     }
 
     if domain::cap_grant(dh_a, 0, dh_b, 5, CapRights::READ).is_err() {
-        fail("demo_userland: cap_grant A->B falhou");
+        fail("demo_userland: cap_grant A->B failed");
     }
     log::write_str("[kernel] cap_grant A->B ok\n");
 
@@ -193,7 +205,7 @@ fn demo_userland() -> ! {
         Ok(n) if n >= 1 => {
             log::write_str("[kernel] revoke_granted A.slot0 ok\n");
         }
-        _ => fail("demo_userland: revoke_granted falhou"),
+        _ => fail("demo_userland: revoke_granted failed"),
     }
 
     userland::install();
@@ -219,8 +231,8 @@ fn setup_domain(
     if bytes.len() > 4096 {
         fail("setup_domain: payload > 4 KiB");
     }
-    let pf = mm::alloc_frame().unwrap_or_else(|| fail("setup_domain: sem frame payload"));
-    let sf = mm::alloc_frame().unwrap_or_else(|| fail("setup_domain: sem frame stack"));
+    let pf = mm::alloc_frame().unwrap_or_else(|| fail("setup_domain: no frame for payload"));
+    let sf = mm::alloc_frame().unwrap_or_else(|| fail("setup_domain: no frame for stack"));
 
     // Copia bytes via physmap (loop manual: target sem SSE).
     // SAFETY: physmap ativo; pf recem-alocado; bytes em higher-half kernel.
@@ -247,16 +259,16 @@ fn setup_domain(
     if domain::insert_root(dh, 0, CapObject::Frame { phys: pf.addr() }, read).is_err()
         || domain::insert_root(dh, 1, CapObject::Frame { phys: sf.addr() }, rw).is_err()
     {
-        fail("setup_domain: insert caps falhou");
+        fail("setup_domain: insert caps failed");
     }
     // SAFETY: pos-init_paging; va lower-half; perm user.
     let r1 = unsafe { domain::map(dh, payload_va, 0, Perm::UserRx) };
     let r2 = unsafe { domain::map(dh, stack_va, 1, Perm::UserRw) };
     if r1.is_err() || r2.is_err() {
-        fail("setup_domain: domain::map falhou");
+        fail("setup_domain: domain::map failed");
     }
     if domain::set_entry(dh, payload_va, stack_va + 0x1000).is_err() {
-        fail("setup_domain: set_entry falhou");
+        fail("setup_domain: set_entry failed");
     }
 }
 
@@ -299,7 +311,6 @@ fn demo_caps() {
         return;
     }
     // Raiz sobrevive; slots 1..3 ficam vazios.
-    use crate::cap::CapError;
     let root_ok = table.lookup(0).is_ok();
     let descendentes_limpos = [1u16, 2, 3]
         .iter()
@@ -355,9 +366,9 @@ fn demo_physmap() {
 /// Imprime "[kernel] free frames: N of T" no log serial.
 fn log_frame_stats() {
     log::write_str("[kernel] free frames: ");
-    log_usize(mm::free_count());
+    serial::write_usize(mm::free_count());
     log::write_str(" of ");
-    log_usize(mm::total_frames());
+    serial::write_usize(mm::total_frames());
     log::write_str("\n");
 }
 
@@ -366,49 +377,13 @@ fn demo_alloc_free() {
     match mm::alloc_frame() {
         Some(frame) => {
             log::write_str("[kernel] alloc frame @ 0x");
-            log_u64_hex(frame.addr());
+            serial::write_hex64(frame.addr());
             log::write_str("\n");
             mm::free_frame(frame);
             log::write_str("[kernel] frame freed; free: ");
-            log_usize(mm::free_count());
+            serial::write_usize(mm::free_count());
             log::write_str("\n");
         }
         None => log::write_str("[kernel] no free frames!\n"),
-    }
-}
-
-/// Loga um `usize` em decimal. Buffer estatico de 20 digitos e suficiente
-/// para u64 (max 20 chars). Evita dependencia de `core::fmt`.
-fn log_usize(mut n: usize) {
-    if n == 0 {
-        log::write_str("0");
-        return;
-    }
-    let mut buf = [0u8; 20];
-    let mut i = 0;
-    while n > 0 {
-        buf[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-        i += 1;
-    }
-    // Reverter in-place para ordem correta.
-    let s = &mut buf[..i];
-    s.reverse();
-    // `s` contem somente digitos ASCII, entao str::from_utf8 e seguro.
-    if let Ok(text) = core::str::from_utf8(s) {
-        log::write_str(text);
-    }
-}
-
-/// Loga `u64` em hexadecimal sem prefixo. 16 digitos, zero-padded.
-fn log_u64_hex(n: u64) {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut buf = [b'0'; 16];
-    for i in 0..16 {
-        let nibble = ((n >> ((15 - i) * 4)) & 0xf) as usize;
-        buf[i] = HEX[nibble];
-    }
-    if let Ok(text) = core::str::from_utf8(&buf) {
-        log::write_str(text);
     }
 }
