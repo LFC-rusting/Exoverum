@@ -70,10 +70,10 @@ extern "sysv64" fn fault_dispatch(ctx: *mut super::userland::UserContext) -> ! {
     let ctx_ref = unsafe { &*ctx };
     let cpl = ctx_ref.cs & 3;
     if cpl == 3 {
-        crate::domain::abort_current();
-        crate::log::write_str("[kernel] ring-3 fault; halting\n");
+        crate::kobj::domain::abort_current();
+        super::serial::write_str("[kernel] ring-3 fault; halting\n");
     } else {
-        crate::log::write_str("[kernel] EXCEPTION ring-0 - halt\n");
+        super::serial::write_str("[kernel] EXCEPTION ring-0 - halt\n");
     }
     super::cpu::halt_forever();
 }
@@ -91,6 +91,40 @@ unsafe extern "sysv64" fn fault_no_err_entry() {
         "call {dispatch}",
         "ud2",
         dispatch = sym fault_dispatch,
+    );
+}
+
+/// Dispatcher Rust do IRQ de timer LAPIC. Apenas delega ao modulo
+/// `timer`, que sinaliza a notification armada, e manda EOI ao LAPIC.
+/// Nao modifica o `UserContext` do interrompido: ring 3 retoma com
+/// estado identico, e so descobre o evento via `poll_notify`.
+#[no_mangle]
+extern "sysv64" fn timer_irq_dispatch() {
+    crate::kobj::timer::fire();
+    super::lapic::eoi();
+}
+
+/// Trampolim para IRQ de timer (vetor 0x40). Salva volatiles + call +
+/// restaura + iretq. Nao usa UserContext (IRQ nao precisa modificar
+/// registros user). Alinhamento SysV: CPU empilha 5 u64 (40B); ate o
+/// call, empilhamos pares de push para manter RSP%16==0 pre-call.
+#[unsafe(naked)]
+unsafe extern "sysv64" fn timer_irq_entry() {
+    core::arch::naked_asm!(
+        // Salva volatiles (caller-saved do SysV que podemos mexer):
+        // rax, rcx, rdx, rsi, rdi, r8-r11. 9 regs = 72 bytes. Com 40B
+        // do iret frame = 112 bytes (nao %16). Adiciono 8 de padding.
+        "push rax", "push rcx", "push rdx", "push rsi",
+        "push rdi", "push r8",  "push r9",  "push r10",
+        "push r11",
+        "sub rsp, 8",
+        "call {dispatch}",
+        "add rsp, 8",
+        "pop r11", "pop r10", "pop r9",  "pop r8",
+        "pop rdi", "pop rsi", "pop rdx", "pop rcx",
+        "pop rax",
+        "iretq",
+        dispatch = sym timer_irq_dispatch,
     );
 }
 
@@ -148,6 +182,13 @@ pub fn init() {
         const USER_INTERRUPT_GATE: u8 = 0xEE;
         let syscall = super::userland::syscall_handler_addr();
         (*idt.add(0x80)).set(syscall, KERNEL_CS, 0, USER_INTERRUPT_GATE);
+
+        // Vetor 0x40 = LAPIC timer. DPL=0 (hardware IRQ). Substitui o
+        // handler generico `h_no_err` que so halta: timer precisa
+        // sinalizar notification + EOI + retornar.
+        let timer_h = timer_irq_entry as *const () as usize as u64;
+        (*idt.add(super::lapic::TIMER_VECTOR as usize))
+            .set(timer_h, KERNEL_CS, 0, INTERRUPT_GATE);
     }
 
     let base = core::ptr::addr_of!(IDT) as u64;
