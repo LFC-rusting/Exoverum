@@ -5,8 +5,9 @@
 //! seguintes junto com o fluxo real de interrupcoes (LAPIC timer, syscall).
 //!
 //! Os 256 vetores apontam para o mesmo handler `exception_entry`. O vetor 8
-//! (#DF) usa IST=1, pulando para a stack dedicada em `gdt::DF_STACK` mesmo
-//! que a stack corrente esteja corrompida.
+//! (#DF) usa IST=1 (`gdt::DF_STACK`) e o vetor 14 (#PF) usa IST=2
+//! (`gdt::PF_STACK`), pulando para stacks dedicadas mesmo que a stack
+//! corrente esteja corrompida — defesa contra stack overflow do kernel.
 
 use core::arch::asm;
 use core::mem::size_of;
@@ -176,6 +177,12 @@ pub fn init() {
         // Double fault (#DF) usa IST1 para garantir stack valida mesmo se
         // a stack do kernel estiver corrompida (recomendacao Intel SDM).
         (*idt.add(8)).set(h_with_err, KERNEL_CS, 1, INTERRUPT_GATE);
+        // Page fault (#PF) usa IST2: stack overflow do kernel atinge
+        // tipicamente a guard page e dispara #PF — sem IST, a CPU
+        // tentaria empilhar o frame na propria stack invalida e
+        // escalaria pra #DF. IST2 garante stack saudavel para o
+        // dispatcher logar e haltar (CPL=0) ou abortar dominio (CPL=3).
+        (*idt.add(14)).set(h_with_err, KERNEL_CS, 2, INTERRUPT_GATE);
 
         // Vetor 0x80 = porta de syscall vinda de ring 3.
         // type_attr 0xEE: P=1, DPL=3 (acessivel a user), Type=0xE (int gate).
