@@ -157,7 +157,7 @@ static PHYS_OFFSET: AtomicU64 = AtomicU64::new(0);
 pub fn phys_to_virt(phys: u64) -> *mut u8 {
     assert!(
         phys < PHYSMAP_BYTES,
-        "phys_to_virt: endereco fisico fora do physmap"
+        "phys_to_virt: physical address outside physmap"
     );
     (phys + PHYS_OFFSET.load(Ordering::Relaxed)) as *mut u8
 }
@@ -293,9 +293,9 @@ fn map_range(
     // assert! (nao debug_assert!): violacao escreveria PTE com bits de
     // offset corrompendo flags W/NX, abrindo escalada de privilegio
     // silenciosa. Custo em release: 3 comparacoes no boot, desprezivel.
-    assert!(vstart & (frame::FRAME_SIZE - 1) == 0, "map_range: vstart desalinhado");
-    assert!(vend & (frame::FRAME_SIZE - 1) == 0, "map_range: vend desalinhado");
-    assert!(phys_start & (frame::FRAME_SIZE - 1) == 0, "map_range: phys_start desalinhado");
+    assert!(vstart & (frame::FRAME_SIZE - 1) == 0, "map_range: vstart misaligned");
+    assert!(vend & (frame::FRAME_SIZE - 1) == 0, "map_range: vend misaligned");
+    assert!(phys_start & (frame::FRAME_SIZE - 1) == 0, "map_range: phys_start misaligned");
     let mut v = vstart;
     let mut p = phys_start;
     while v < vend {
@@ -347,7 +347,7 @@ fn ensure_next_level(parent_phys: u64, idx: usize) -> Result<u64, PagingError> {
     use paging::{make_intermediate_pte, pte_phys, pte_present};
     // assert!: idx >= 512 escreveria fora da tabela de 4 KiB, corrompendo
     // a tabela seguinte na RAM. Catastrofico.
-    assert!(idx < 512, "ensure_next_level: idx fora da tabela");
+    assert!(idx < 512, "ensure_next_level: idx out of table");
     // SAFETY: `parent_phys` foi alocado por nos (PML4 inicial ou frame
     // criado pela propria recursao). `phys_to_virt` da ponteiro valido
     // sob o mapa vigente. `idx < 512` (assert acima). Leitura de 8 bytes
@@ -390,9 +390,9 @@ fn ensure_next_level(parent_phys: u64, idx: usize) -> Result<u64, PagingError> {
 pub unsafe fn map_kernel_page(virt: u64, phys: u64, perm: Perm) -> Result<(), PagingError> {
     use crate::arch::x86_64::cpu;
     // assert!: ver justificativa em `map_range`. Mesma classe de bug.
-    assert_eq!(virt & (frame::FRAME_SIZE - 1), 0, "map_kernel_page: virt desalinhado");
-    assert_eq!(phys & (frame::FRAME_SIZE - 1), 0, "map_kernel_page: phys desalinhado");
-    assert!(!perm.is_user(), "map_kernel_page: Perm user proibido aqui");
+    assert_eq!(virt & (frame::FRAME_SIZE - 1), 0, "map_kernel_page: virt misaligned");
+    assert_eq!(phys & (frame::FRAME_SIZE - 1), 0, "map_kernel_page: phys misaligned");
+    assert!(!perm.is_user(), "map_kernel_page: user Perm forbidden here");
     let pml4_phys = cpu::read_cr3() & paging::PTE_ADDR_MASK;
     map_4k(pml4_phys, virt, phys, perm)?;
     // TLB invalidate da pagina recem-mapeada: escritas anteriores em PTEs
@@ -420,13 +420,13 @@ pub unsafe fn map_user_page(
     phys: u64,
     perm: Perm,
 ) -> Result<(), PagingError> {
-    assert!(perm.is_user(), "map_user_page: Perm kernel proibido aqui");
-    assert_eq!(virt & (frame::FRAME_SIZE - 1), 0, "map_user_page: virt desalinhado");
-    assert_eq!(phys & (frame::FRAME_SIZE - 1), 0, "map_user_page: phys desalinhado");
+    assert!(perm.is_user(), "map_user_page: kernel Perm forbidden here");
+    assert_eq!(virt & (frame::FRAME_SIZE - 1), 0, "map_user_page: virt misaligned");
+    assert_eq!(phys & (frame::FRAME_SIZE - 1), 0, "map_user_page: phys misaligned");
     // Lower-half: bits [63:47] devem ser zero (canonico user).
     assert!(
         virt < 0x0000_8000_0000_0000,
-        "map_user_page: virt fora do lower-half user"
+        "map_user_page: virt outside user lower-half"
     );
     map_4k(pml4_phys, virt, phys, perm)
 }

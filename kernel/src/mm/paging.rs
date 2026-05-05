@@ -179,7 +179,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn perm_flags_enforcam_wx() {
+    fn perm_flags_enforce_wx() {
         assert_eq!(Perm::Rx.flags(), PTE_PRESENT);
         assert_eq!(Perm::Ro.flags(), PTE_PRESENT | PTE_NO_EXECUTE);
         assert_eq!(Perm::Rw.flags(), PTE_PRESENT | PTE_WRITABLE | PTE_NO_EXECUTE);
@@ -190,16 +190,16 @@ mod tests {
     }
 
     #[test]
-    fn perm_user_seta_user_bit_e_respeita_wx() {
+    fn perm_user_sets_user_bit_and_respects_wx() {
         let urx = Perm::UserRx.flags();
-        assert_ne!(urx & PTE_USER, 0, "UserRx exige PTE_USER (ring 3)");
-        assert_eq!(urx & PTE_WRITABLE, 0, "UserRx nunca escrevivel (W^X)");
-        assert_eq!(urx & PTE_NO_EXECUTE, 0, "UserRx executavel");
+        assert_ne!(urx & PTE_USER, 0, "UserRx requires PTE_USER (ring 3)");
+        assert_eq!(urx & PTE_WRITABLE, 0, "UserRx never writable (W^X)");
+        assert_eq!(urx & PTE_NO_EXECUTE, 0, "UserRx executable");
 
         let urw = Perm::UserRw.flags();
-        assert_ne!(urw & PTE_USER, 0, "UserRw exige PTE_USER");
+        assert_ne!(urw & PTE_USER, 0, "UserRw requires PTE_USER");
         assert_ne!(urw & PTE_WRITABLE, 0);
-        assert_ne!(urw & PTE_NO_EXECUTE, 0, "UserRw nunca executavel (W^X)");
+        assert_ne!(urw & PTE_NO_EXECUTE, 0, "UserRw never executable (W^X)");
 
         assert!(Perm::UserRx.is_user());
         assert!(Perm::UserRw.is_user());
@@ -208,17 +208,17 @@ mod tests {
     }
 
     #[test]
-    fn perm_mmio_eh_uncacheable_e_nx() {
+    fn perm_mmio_is_uncacheable_and_nx() {
         let f = Perm::Mmio.flags();
         assert_ne!(f & PTE_PRESENT, 0);
         assert_ne!(f & PTE_WRITABLE, 0);
-        assert_ne!(f & PTE_NO_EXECUTE, 0, "MMIO nunca deve ser executavel");
-        assert_ne!(f & PTE_CACHE_DISABLE, 0, "PCD exigido por Intel SDM 10.4.1");
-        assert_ne!(f & PTE_WRITE_THROUGH, 0, "PWT exigido por Intel SDM 10.4.1");
+        assert_ne!(f & PTE_NO_EXECUTE, 0, "MMIO must never be executable");
+        assert_ne!(f & PTE_CACHE_DISABLE, 0, "PCD required by Intel SDM 10.4.1");
+        assert_ne!(f & PTE_WRITE_THROUGH, 0, "PWT required by Intel SDM 10.4.1");
     }
 
     #[test]
-    fn indices_decompoe_endereco() {
+    fn indices_decomposes_address() {
         // vaddr = 0x0000_7FFF_FFFF_F000: maior endereco canonico user-space
         // low-half. pml4=255, pdpt=511, pd=511, pt=511.
         let i = Indices::from_virt(0x0000_7FFF_FFFF_F000);
@@ -239,7 +239,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_aceita_limites() {
+    fn canonical_accepts_limits() {
         assert!(is_canonical(0x0000_0000_0000_0000));
         assert!(is_canonical(0x0000_7FFF_FFFF_FFFF));
         assert!(is_canonical(0xFFFF_8000_0000_0000));
@@ -250,7 +250,7 @@ mod tests {
     }
 
     #[test]
-    fn make_pte_combina_endereco_e_flags() {
+    fn make_pte_combines_address_and_flags() {
         let pte = make_pte(0x200_000, Perm::Rx);
         assert_eq!(pte_phys(pte), 0x200_000);
         assert!(pte_present(pte));
@@ -264,13 +264,13 @@ mod tests {
     }
 
     #[test]
-    fn make_huge_seta_ps_e_respeita_perm() {
+    fn make_huge_sets_ps_and_respects_perm() {
         // PDPTE de 1 GiB em phys=0, perm=Rw (physmap caso base).
         let pte = make_huge_pte(0, Perm::Rw);
-        assert_ne!(pte & PTE_HUGE, 0, "PS deve estar setado em huge PTE");
+        assert_ne!(pte & PTE_HUGE, 0, "PS must be set on huge PTE");
         assert_ne!(pte & PTE_PRESENT, 0);
         assert_ne!(pte & PTE_WRITABLE, 0);
-        assert_ne!(pte & PTE_NO_EXECUTE, 0, "physmap e RW+NX");
+        assert_ne!(pte & PTE_NO_EXECUTE, 0, "physmap is RW+NX");
         assert_eq!(pte_phys(pte), 0);
 
         // 1 GiB-alinhado: 0x4000_0000.
@@ -279,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn make_intermediate_tem_write_user_e_sem_nx() {
+    fn make_intermediate_has_write_user_and_no_nx() {
         let pte = make_intermediate_pte(0x400_000);
         assert_ne!(pte & PTE_PRESENT, 0);
         assert_ne!(pte & PTE_WRITABLE, 0);
@@ -292,7 +292,7 @@ mod tests {
     }
 
     #[test]
-    fn addr_mask_ignora_flags() {
+    fn addr_mask_ignores_flags() {
         let pte = 0xDEAD_BEEF_C0DE_F007u64;
         assert_eq!(pte_phys(pte) & 0xFFF, 0);
     }

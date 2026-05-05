@@ -325,21 +325,21 @@ mod tests {
     }
 
     #[test]
-    fn init_rejeita_desc_size_pequeno() {
+    fn init_rejects_small_desc_size() {
         let mut a = FrameAllocator::empty();
         let buf = vec![0u8; 32];
         assert_eq!(a.init(&buf, 32, &[]), Err(FrameError::InvalidDescriptorSize));
     }
 
     #[test]
-    fn init_rejeita_len_desalinhado() {
+    fn init_rejects_misaligned_len() {
         let mut a = FrameAllocator::empty();
         let buf = vec![0u8; 41]; // nao multiplo de 40
         assert_eq!(a.init(&buf, 40, &[]), Err(FrameError::InvalidMemoryMap));
     }
 
     #[test]
-    fn init_marca_conventional_livre() {
+    fn init_marks_conventional_free() {
         // 1 regiao conventional em 0x100000 (1 MiB) com 4 paginas.
         let (buf, ds) = build_map(&[(EFI_CONVENTIONAL_MEMORY, 0x100000, 4)]);
         let mut a = FrameAllocator::empty();
@@ -348,7 +348,7 @@ mod tests {
     }
 
     #[test]
-    fn init_reserva_low_memory_incondicionalmente() {
+    fn init_reserves_low_memory_unconditionally() {
         // Firmware reporta toda a faixa baixa como ConventionalMemory.
         // Invariante: frames 0..256 (primeiro 1 MiB) jamais alocaveis.
         let (buf, ds) = build_map(&[(EFI_CONVENTIONAL_MEMORY, 0, 512)]);
@@ -358,11 +358,11 @@ mod tests {
         assert_eq!(a.free_count(), 256);
         // E nenhuma alocacao pode devolver endereco < 1 MiB.
         let f = a.alloc().unwrap();
-        assert!(f.addr() >= 0x100000, "alocou frame em low memory: {:#x}", f.addr());
+        assert!(f.addr() >= 0x100000, "allocated frame in low memory: {:#x}", f.addr());
     }
 
     #[test]
-    fn init_ignora_nao_conventional() {
+    fn init_ignores_non_conventional() {
         let (buf, ds) = build_map(&[
             (3 /* LoaderCode */, 0x200000, 10),
             (EFI_CONVENTIONAL_MEMORY, 0x400000, 2),
@@ -373,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn init_reserved_sobrepoe_conventional() {
+    fn init_reserved_overrides_conventional() {
         // 8 paginas em 0x10000; reservamos 2 delas.
         let (buf, ds) = build_map(&[(EFI_CONVENTIONAL_MEMORY, 0x100000, 8)]);
         let mut a = FrameAllocator::empty();
@@ -383,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn alloc_retorna_frame_e_decrementa_free() {
+    fn alloc_returns_frame_and_decrements_free() {
         let (buf, ds) = build_map(&[(EFI_CONVENTIONAL_MEMORY, 0x100000, 3)]);
         let mut a = FrameAllocator::empty();
         a.init(&buf, ds, &[]).unwrap();
@@ -399,7 +399,7 @@ mod tests {
     }
 
     #[test]
-    fn free_restaura_frame() {
+    fn free_restores_frame() {
         let (buf, ds) = build_map(&[(EFI_CONVENTIONAL_MEMORY, 0x100000, 2)]);
         let mut a = FrameAllocator::empty();
         a.init(&buf, ds, &[]).unwrap();
@@ -413,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn free_de_frame_ja_livre_e_noop() {
+    fn free_of_already_free_frame_is_noop() {
         let (buf, ds) = build_map(&[(EFI_CONVENTIONAL_MEMORY, 0x100000, 2)]);
         let mut a = FrameAllocator::empty();
         a.init(&buf, ds, &[]).unwrap();
@@ -423,7 +423,7 @@ mod tests {
     }
 
     #[test]
-    fn clampa_acima_de_max_managed_frames() {
+    fn clamps_above_max_managed_frames() {
         // Regiao 1 frame alem do limite: MAX_MANAGED_FRAMES frames.
         let base = MAX_MANAGED_FRAMES as u64 * FRAME_SIZE;
         let (buf, ds) = build_map(&[(EFI_CONVENTIONAL_MEMORY, base - FRAME_SIZE, 2)]);
@@ -434,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn phys_frame_containing_address_trunca() {
+    fn phys_frame_containing_address_truncates() {
         let f = PhysFrame::containing_address(0x12345);
         assert_eq!(f.addr(), 0x12000);
         assert_eq!(f.index(), 0x12);
