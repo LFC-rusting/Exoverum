@@ -126,9 +126,13 @@ static mut TSS: Tss = Tss {
     iomap_base: TSS_SIZE,
 };
 
-// Stack dedicada ao handler de double fault (apontada via IST1).
+// Stacks dedicadas para handlers criticos. IST1 cobre #DF (Intel SDM
+// recomenda explicitamente); IST2 cobre #PF para que um stack overflow
+// do kernel — que tipicamente dispara #PF na guard page — nao mascare
+// o proprio fault tentando empilhar o frame numa stack ja invalida.
 const IST_STACK_SIZE: usize = 16 * 1024;
 static mut DF_STACK: [u8; IST_STACK_SIZE] = [0; IST_STACK_SIZE];
+static mut PF_STACK: [u8; IST_STACK_SIZE] = [0; IST_STACK_SIZE];
 
 #[repr(C, packed)]
 struct GdtPtr {
@@ -165,6 +169,8 @@ pub fn init() {
     let tss_base = core::ptr::addr_of!(TSS) as u64;
     let df_stack_top =
         (core::ptr::addr_of!(DF_STACK) as u64) + IST_STACK_SIZE as u64;
+    let pf_stack_top =
+        (core::ptr::addr_of!(PF_STACK) as u64) + IST_STACK_SIZE as u64;
 
     // SAFETY: `init` roda uma unica vez; nenhum reader concorrente de TSS
     // porque ainda nao carregamos a GDT nova. Escrita via ponteiro bruto
@@ -172,6 +178,7 @@ pub fn init() {
     unsafe {
         let tss_ptr = core::ptr::addr_of_mut!(TSS);
         (*tss_ptr).ist1 = df_stack_top;
+        (*tss_ptr).ist2 = pf_stack_top;
     }
 
     // Codifico o descriptor de TSS (16 bytes). Intel SDM 3A 7.2.3.
