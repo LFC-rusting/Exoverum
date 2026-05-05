@@ -200,7 +200,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ranges_overlap_casos() {
+    fn ranges_overlap_cases() {
         assert!(ranges_overlap(0, 10, 5, 15));
         assert!(ranges_overlap(5, 15, 0, 10));
         assert!(ranges_overlap(0, 10, 0, 10));
@@ -209,13 +209,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_header_rejeita_truncado() {
+    fn parse_header_rejects_truncated() {
         let buf = [0u8; 10];
         assert!(parse_elf_header(&buf).is_err());
     }
 
     #[test]
-    fn validate_rejeita_magic_invalido() {
+    fn validate_rejects_invalid_magic() {
         let mut buf = [0u8; 64];
         buf[0] = 0xAA;
         assert!(validate_kernel_elf(&buf).is_err());
