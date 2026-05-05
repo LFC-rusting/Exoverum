@@ -36,8 +36,11 @@
 
 use core::cell::UnsafeCell;
 
+use crate::arch::x86_64::serial as log;
 use crate::arch::x86_64::userland::UserContext;
-use crate::cap::{CapError, CapObject, CapRights, CapSlot, CapTable, CAP_SLOTS};
+use crate::kobj::cap::{CapError, CapObject, CapRights, CapSlot, CapTable, CAP_SLOTS};
+use crate::kobj::notification::{self, NotifyHandle};
+use crate::kobj::timer;
 use crate::mm::{self, Perm};
 
 /// Numero maximo de dominios simultaneos. KISS.
@@ -479,7 +482,92 @@ pub fn abort_current() {
         table[idx].caller = None;
     }
     set_current(None);
-    crate::log::write_str("[kernel] domain abort (ring-3 fault)\n");
+    log::write_str("[kernel] domain abort (ring-3 fault)\n");
+}
+
+// =================================================================
+// Notification cap handling (Phase 7b extension)
+// =================================================================
+
+/// Sinaliza um Notification object via cap no CSpace do dominio atual.
+/// Cap deve ter direito `WRITE`. `bits=0` e no-op valido.
+///
+/// Chamado pela syscall `notify` (userland::syscall_dispatch n=4).
+pub fn notify(slot: CapSlot, bits: u64) -> Result<(), DomainError> {
+    let cur_h = current().ok_or(DomainError::NoCurrentDomain)?;
+    let cur_idx = cur_h.0 as usize;
+    // SAFETY: idem padrao deste modulo.
+    let table = unsafe { &*DOMAINS.0.get() };
+    let (object, rights) = table[cur_idx].cspace.lookup(slot)?;
+    let handle = match object {
+        CapObject::Notification { handle } => handle,
+        _ => return Err(DomainError::WrongType),
+    };
+    if !rights.contains(CapRights::WRITE) {
+        return Err(DomainError::InsufficientRights);
+    }
+    notification::signal(NotifyHandle::from_raw(handle), bits)
+        .map_err(|_| DomainError::BadHandle)?;
+    Ok(())
+}
+
+/// Le e zera o signalword do Notification apontado pelo cap. Cap deve
+/// ter direito `READ`. Retorna os bits que estavam setados.
+///
+/// Chamado pela syscall `poll_notify` (n=5).
+pub fn poll_notify(slot: CapSlot) -> Result<u64, DomainError> {
+    let cur_h = current().ok_or(DomainError::NoCurrentDomain)?;
+    let cur_idx = cur_h.0 as usize;
+    // SAFETY: idem.
+    let table = unsafe { &*DOMAINS.0.get() };
+    let (object, rights) = table[cur_idx].cspace.lookup(slot)?;
+    let handle = match object {
+        CapObject::Notification { handle } => handle,
+        _ => return Err(DomainError::WrongType),
+    };
+    if !rights.contains(CapRights::READ) {
+        return Err(DomainError::InsufficientRights);
+    }
+    notification::poll(NotifyHandle::from_raw(handle))
+        .map_err(|_| DomainError::BadHandle)
+}
+
+/// Arma timer one-shot. Requer `CapObject::Timer` (direito WRITE) em
+/// `timer_slot` e `CapObject::Notification` (direito WRITE) em
+/// `notif_slot`. No disparo do LAPIC, kernel sinaliza a notification
+/// com `bits`. Ticks=0 desarma.
+///
+/// Chamado pela syscall `timer_arm_oneshot` (n=6).
+pub fn arm_timer(
+    timer_slot: CapSlot,
+    ticks: u32,
+    notif_slot: CapSlot,
+    bits: u64,
+) -> Result<(), DomainError> {
+    let cur_h = current().ok_or(DomainError::NoCurrentDomain)?;
+    let cur_idx = cur_h.0 as usize;
+    // SAFETY: idem padrao.
+    let table = unsafe { &*DOMAINS.0.get() };
+    // Valida Timer cap.
+    let (t_obj, t_rights) = table[cur_idx].cspace.lookup(timer_slot)?;
+    if !matches!(t_obj, CapObject::Timer) {
+        return Err(DomainError::WrongType);
+    }
+    if !t_rights.contains(CapRights::WRITE) {
+        return Err(DomainError::InsufficientRights);
+    }
+    // Valida Notification cap.
+    let (n_obj, n_rights) = table[cur_idx].cspace.lookup(notif_slot)?;
+    let n_handle = match n_obj {
+        CapObject::Notification { handle } => handle,
+        _ => return Err(DomainError::WrongType),
+    };
+    if !n_rights.contains(CapRights::WRITE) {
+        return Err(DomainError::InsufficientRights);
+    }
+    timer::arm(NotifyHandle::from_raw(n_handle), bits, ticks)
+        .map_err(|_| DomainError::BadHandle)?;
+    Ok(())
 }
 
 // =================================================================
@@ -564,7 +652,7 @@ pub unsafe fn pct_call(
     set_current(Some(target_h));
     // SAFETY: cr3 valido (clone_kernel_higher_half do target).
     unsafe { crate::arch::x86_64::cpu::load_cr3(cr3) };
-    crate::log::write_str("[kernel] pct_call ok\n");
+    log::write_str("[kernel] pct_call ok\n");
     Ok(())
 }
 
@@ -594,7 +682,7 @@ pub unsafe fn pct_reply(
     set_current(Some(caller));
     // SAFETY: cr3 do caller, clone_kernel_higher_half.
     unsafe { crate::arch::x86_64::cpu::load_cr3(cr3) };
-    crate::log::write_str("[kernel] pct_reply ok\n");
+    log::write_str("[kernel] pct_reply ok\n");
     Ok(())
 }
 
