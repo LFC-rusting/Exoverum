@@ -1,8 +1,10 @@
 //! Biblioteca do kernel Exoverum.
 //!
-//! Expoe modulos em camadas:
-//!   - `arch::x86_64` concentra todo o `unsafe` (portas I/O, GDT/IDT, MSR).
-//!   - `log`, `panic`, `kmain` sao logica safe.
+//! Organizacao:
+//!   - `arch::x86_64` — unsafe de hardware (portas I/O, GDT/IDT, MSR, LAPIC).
+//!   - `mm`           — frame allocator + paging (target-agnostic).
+//!   - `kobj`         — cap, domain, notification, timer (objetos de kernel).
+//!   - `fb`, `kmain`  — bare-metal glue.
 //!
 //! O binario (`src/main.rs`) apenas chama `kmain::start`. O panic handler
 //! vive aqui para ser compartilhado com o bin via link.
@@ -15,25 +17,23 @@
 #[cfg(target_os = "none")]
 pub mod arch;
 #[cfg(target_os = "none")]
-pub mod log;
-#[cfg(target_os = "none")]
 pub mod kmain;
 // Renderer minimo do framebuffer UEFI. Bare-metal-only (depende de
 // mm::map_kernel_page e Perm::Mmio).
 #[cfg(target_os = "none")]
 pub mod fb;
 
-// `mm` e target-agnostico (logica pura; so manipula bytes), entao
-// pode ser compilado e testado em host.
+// `mm` e target-agnostico (logica pura; so manipula bytes); host-testavel.
 pub mod mm;
 
-// `cap` e pure safe Rust (#![forbid(unsafe_code)]). Host-testavel.
-pub mod cap;
+// `kobj`: capabilities + dominio + notification + timer. Host-testavel
+// exceto `domain` (gated em target_os = none).
+pub mod kobj;
 
-// `domain` (Phase 7a + 7b): dominios ring 3 com CSpace propria,
-// CR3 proprio, upcalls, PCT, cap_grant. Bare-metal-only (depende
-// de mm::init_paging e arch).
-#[cfg(target_os = "none")]
-pub mod domain;
-
-mod panic;
+// Panic handler bare-metal. Nao entra em host tests.
+#[cfg(all(target_os = "none", not(test)))]
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    crate::arch::x86_64::serial::write_str("[kernel] PANIC\n");
+    crate::arch::x86_64::cpu::halt_forever();
+}
