@@ -28,8 +28,8 @@ use core::arch::global_asm;
 
 use crate::arch::x86_64::cpu;
 use crate::arch::x86_64::gdt::{USER_CS, USER_DS};
-use crate::domain;
-use crate::log;
+use crate::kobj::domain;
+use super::serial as log;
 
 // =================================================================
 // UserContext
@@ -255,10 +255,14 @@ fn syscall_stack_top() -> u64 {
 /// o estado (potencialmente novo) ring 3.
 ///
 /// Syscalls:
-///   - 0  `nop_test`       -> retorna 0
-///   - 1  `exit`           -> halta (nao retorna)
-///   - 2  `domain_call(t)` -> PCT sync; muda ctx para o dominio `t`
-///   - 3  `domain_reply(v)`-> PCT sync; muda ctx para o caller
+///   - 0  `nop_test`            -> retorna 0
+///   - 1  `exit`                -> halta (nao retorna)
+///   - 2  `domain_call(t)`      -> PCT sync; muda ctx para o dominio `t`
+///   - 3  `domain_reply(v)`     -> PCT sync; muda ctx para o caller
+///   - 4  `notify(slot, bits)`  -> OR bits no Notification (cap WRITE)
+///   - 5  `poll_notify(slot)`   -> swap bits->0 no Notification (cap READ)
+///   - 6  `timer_arm_oneshot(t, ticks, n, bits)` -> LAPIC oneshot que
+///        sinaliza Notification n com bits apos ticks (cap Timer+Notif WRITE)
 extern "sysv64" fn syscall_dispatch(ctx: *mut UserContext) {
     // SAFETY: `ctx` aponta para UserContext na SYSCALL_STACK,
     // construido pelo trampolim. Single-core; nao ha alias.
@@ -295,6 +299,38 @@ extern "sysv64" fn syscall_dispatch(ctx: *mut UserContext) {
                 log::write_str("[kernel] pct_reply err\n");
                 let _ = e;
                 ctx_ref.rax = u64::MAX;
+            }
+        }
+        4 => {
+            // notify(slot, bits) — slot em RDI (u16), bits em RSI.
+            let slot = ctx_ref.rdi as u16;
+            let bits = ctx_ref.rsi;
+            match domain::notify(slot, bits) {
+                Ok(()) => ctx_ref.rax = 0,
+                Err(_) => ctx_ref.rax = u64::MAX,
+            }
+        }
+        5 => {
+            // poll_notify(slot) — slot em RDI. Retorna signalword em RAX.
+            let slot = ctx_ref.rdi as u16;
+            match domain::poll_notify(slot) {
+                Ok(v) => ctx_ref.rax = v,
+                Err(_) => ctx_ref.rax = u64::MAX,
+            }
+        }
+        6 => {
+            // timer_arm_oneshot(timer_slot, ticks, notif_slot, bits)
+            //   RDI = timer_slot (u16 low), RSI = ticks (u32 low),
+            //   RDX = notif_slot (u16 low), R10 = bits (u64).
+            // Uso R10 para o 4o argumento; RCX e volatil mas usado
+            // pelo syscall entry no Linux (nao aqui), entao R10 e KISS.
+            let timer_slot = ctx_ref.rdi as u16;
+            let ticks = ctx_ref.rsi as u32;
+            let notif_slot = ctx_ref.rdx as u16;
+            let bits = ctx_ref.r10;
+            match domain::arm_timer(timer_slot, ticks, notif_slot, bits) {
+                Ok(()) => ctx_ref.rax = 0,
+                Err(_) => ctx_ref.rax = u64::MAX,
             }
         }
         _ => {
