@@ -334,8 +334,13 @@ extern "sysv64" fn syscall_dispatch(ctx: *mut UserContext) {
             }
         }
         _ => {
-            log::write_str("[kernel] unknown syscall; halt\n");
-            cpu::halt_forever();
+            // Syscall desconhecido: kernel REJEITA via erro de retorno.
+            // NUNCA halta. Halt era DoS: LibOS adversaria/bugada com RAX
+            // arbitrario travaria o sistema (vetor encontrado por fuzzing
+            // de syscall_dispatch). Retornar erro e mecanismo (expose information);
+            // decidir o que fazer com o erro e politica do LibOS.
+            log::write_str("[kernel] unknown syscall; rejecting\n");
+            ctx_ref.rax = u64::MAX;
         }
     }
 }
