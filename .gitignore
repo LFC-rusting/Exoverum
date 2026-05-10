@@ -2,7 +2,9 @@
 /target/
 
 # Diretórios internos
-/.windsurf/
+/.vscode/
+/fuzz/
+/docs/
 
 # Arquivos temporários de editor/SO
 **/*.swp
