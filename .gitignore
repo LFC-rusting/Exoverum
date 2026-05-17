@@ -2,8 +2,6 @@
 /target/
 
 # Diretórios internos
-/.vscode/
-/fuzz/
 /docs/
 
 # Arquivos temporários de editor/SO
