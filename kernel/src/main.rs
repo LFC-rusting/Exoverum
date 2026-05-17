@@ -8,6 +8,20 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+// Stub panic handler para targets nao-bare-metal (e.g. uefi, default do
+// workspace usado por `cargo check`/`clippy`). Em target_os = "none" o
+// bin linka contra a lib `kernel` e usa o handler real definido em
+// `kernel::panic`; aqui ele e gated fora para evitar duplicate lang item.
+// Em test builds (`cargo test --target linux-gnu`), std injeta panic_impl
+// e nao queremos colidir.
+#[cfg(all(not(target_os = "none"), not(test)))]
+#[panic_handler]
+fn panic_stub(_info: &core::panic::PanicInfo) -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
 // Entry point so existe em builds bare-metal (target_os = "none"). Em builds
 // de host (cargo test, rust-analyzer default) o arquivo fica vazio para nao
 // referenciar `kernel::kmain`, que esta gated fora. Evita falsos erros de
@@ -19,7 +33,7 @@ mod entry {
     // Stack embutida no .bss do kernel via linker.ld. Necessaria porque o
     // bootloader deixa RSP apontando para a stack UEFI, que nao sera mais
     // mapeada apos a troca de CR3 para o PML4 do kernel.
-    extern "C" {
+    unsafe extern "C" {
         static __kernel_stack_top: u8;
     }
 
@@ -48,7 +62,7 @@ mod entry {
     ///   do alocador global.
     /// - Caller deve garantir CR3 com identity map UEFI ainda vigente
     ///   (kernel ainda nao trocou para seu proprio PML4).
-    #[no_mangle]
+    #[unsafe(no_mangle)]
     pub unsafe extern "sysv64" fn kernel_start(bootinfo: *const BootInfo) -> ! {
         // SAFETY:
         // - `__kernel_stack_top` definido pelo linker (`linker.ld`), 16 KiB-
