@@ -119,7 +119,7 @@ pub unsafe fn init() -> Result<(), LapicError> {
         // Enable global (bit 11) caso firmware tenha deixado off.
         wrmsr(MSR_APIC_BASE, base_msr | APIC_BASE_ENABLE);
     }
-    let phys = (base_msr & APIC_BASE_MASK) | 0; // 4KiB-aligned por construcao do MSR.
+    let phys = base_msr & APIC_BASE_MASK; // 4KiB-aligned por construcao do MSR.
 
     // Mapeia 1 pagina MMIO em VA kernel fixa.
     // SAFETY: pos-init_paging por contrato da funcao. LAPIC_VA 4KiB-aligned;
