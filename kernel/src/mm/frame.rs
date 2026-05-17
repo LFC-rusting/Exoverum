@@ -122,7 +122,7 @@ impl FrameAllocator {
         if desc_size < EFI_DESCRIPTOR_MIN_SIZE {
             return Err(FrameError::InvalidDescriptorSize);
         }
-        if map_bytes.is_empty() || map_bytes.len() % desc_size != 0 {
+        if map_bytes.is_empty() || !map_bytes.len().is_multiple_of(desc_size) {
             return Err(FrameError::InvalidMemoryMap);
         }
 
@@ -159,7 +159,7 @@ impl FrameAllocator {
             let start_idx = (r.start / FRAME_SIZE) as usize;
             // Arredonda endereco final para cima para cobrir frame parcial.
             let end_addr = r.end;
-            let end_idx = ((end_addr + FRAME_SIZE - 1) / FRAME_SIZE) as usize;
+            let end_idx = end_addr.div_ceil(FRAME_SIZE) as usize;
             self.mark_range_used(start_idx, end_idx);
         }
 
