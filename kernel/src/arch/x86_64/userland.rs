@@ -112,7 +112,7 @@ __userland_payload_end:
     "#
 );
 
-extern "C" {
+unsafe extern "C" {
     static __userland_payload_start: u8;
     static __userland_payload_end: u8;
 }
@@ -190,7 +190,7 @@ __userland_payload_b_end:
     "#
 );
 
-extern "C" {
+unsafe extern "C" {
     static __userland_payload_a_start: u8;
     static __userland_payload_a_end: u8;
     static __userland_payload_a_target_offset: u64;
@@ -262,7 +262,7 @@ fn syscall_stack_top() -> u64 {
 ///   - 4  `notify(slot, bits)`  -> OR bits no Notification (cap WRITE)
 ///   - 5  `poll_notify(slot)`   -> swap bits->0 no Notification (cap READ)
 ///   - 6  `timer_arm_oneshot(t, ticks, n, bits)` -> LAPIC oneshot que
-///        sinaliza Notification n com bits apos ticks (cap Timer+Notif WRITE)
+///     sinaliza Notification n com bits apos ticks (cap Timer+Notif WRITE)
 extern "sysv64" fn syscall_dispatch(ctx: *mut UserContext) {
     // SAFETY: `ctx` aponta para UserContext na SYSCALL_STACK,
     // construido pelo trampolim. Single-core; nao ha alias.
