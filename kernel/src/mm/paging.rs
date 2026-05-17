@@ -167,6 +167,13 @@ pub const fn is_canonical(vaddr: u64) -> bool {
     high == 0 || high == 0x1_FFFF
 }
 
+// Usar PhysFrame/FRAME_SIZE para convencao de tamanho/alinhamento nos testes.
+const _: () = {
+    assert!(FRAME_SIZE == 4096);
+    assert!(core::mem::size_of::<PageTable>() == 4096);
+    assert!(core::mem::size_of::<PhysFrame>() <= 16);
+};
+
 // =====================================================================
 // Testes de host
 // =====================================================================
@@ -298,9 +305,3 @@ mod tests {
     }
 }
 
-// Usar PhysFrame/FRAME_SIZE para convencao de tamanho/alinhamento nos testes.
-const _: () = {
-    assert!(FRAME_SIZE == 4096);
-    assert!(core::mem::size_of::<PageTable>() == 4096);
-    assert!(core::mem::size_of::<PhysFrame>() <= 16);
-};
