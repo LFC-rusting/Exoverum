@@ -100,7 +100,7 @@ pub fn total_frames() -> usize {
 // referencias a simbolos externos sem tipo concreto.
 
 #[cfg(target_os = "none")]
-extern "C" {
+unsafe extern "C" {
     static __text_start: u8;
     static __text_end: u8;
     static __rodata_start: u8;
