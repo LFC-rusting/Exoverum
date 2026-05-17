@@ -77,9 +77,9 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
 
 fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
     let mut w = [0u32; 64];
-    for t in 0..16 {
+    for (t, word) in w.iter_mut().take(16).enumerate() {
         let start = t * 4;
-        w[t] = u32::from_be_bytes(block[start..start + 4].try_into().unwrap());
+        *word = u32::from_be_bytes(block[start..start + 4].try_into().unwrap());
     }
     for t in 16..64 {
         let s0 = w[t - 15].rotate_right(7) ^ w[t - 15].rotate_right(18) ^ (w[t - 15] >> 3);
