@@ -584,10 +584,10 @@ fn caller_has_domain_cap(caller_idx: usize, target: DomainHandle) -> bool {
     let cspace = &table[caller_idx].cspace;
     let mut slot: u16 = 0;
     while (slot as usize) < CAP_SLOTS {
-        if let Ok((CapObject::Domain { handle }, _)) = cspace.lookup(slot) {
-            if handle == target.0 {
-                return true;
-            }
+        if let Ok((CapObject::Domain { handle }, _)) = cspace.lookup(slot)
+            && handle == target.0
+        {
+            return true;
         }
         slot += 1;
     }
