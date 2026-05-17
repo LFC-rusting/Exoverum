@@ -339,10 +339,10 @@ impl CapTable {
         if let CapEntry::Cap { first_child, .. } = &mut self.entries[parent as usize] {
             *first_child = dst;
         }
-        if old_first != NULL_SLOT {
-            if let CapEntry::Cap { prev_sibling, .. } = &mut self.entries[old_first as usize] {
-                *prev_sibling = dst;
-            }
+        if old_first != NULL_SLOT
+            && let CapEntry::Cap { prev_sibling, .. } = &mut self.entries[old_first as usize]
+        {
+            *prev_sibling = dst;
         }
     }
 
@@ -367,10 +367,10 @@ impl CapTable {
                 *first_child = next;
             }
         }
-        if next != NULL_SLOT {
-            if let CapEntry::Cap { prev_sibling, .. } = &mut self.entries[next as usize] {
-                *prev_sibling = prev;
-            }
+        if next != NULL_SLOT
+            && let CapEntry::Cap { prev_sibling, .. } = &mut self.entries[next as usize]
+        {
+            *prev_sibling = prev;
         }
         self.entries[slot as usize] = CapEntry::Empty;
         Ok(())
