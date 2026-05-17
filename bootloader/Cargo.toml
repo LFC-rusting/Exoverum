@@ -1,8 +1,8 @@
 [package]
 name = "bootloader"
 version = "0.0.1"
-edition = "2021"
-license = "Unlicense"
+edition.workspace = true
+license.workspace = true
 publish = false
 
 [lib]
