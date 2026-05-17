@@ -65,7 +65,7 @@ struct IdtPtr {
 ///   - **CPL=0**: kernel faltou; loga e halta (security > liveness).
 ///   - **CPL=3**: dominio user faltou; chama `domain::abort_current`
 ///     que marca aborted e zera CURRENT, depois halta.
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "sysv64" fn fault_dispatch(ctx: *mut super::userland::UserContext) -> ! {
     // SAFETY: ctx aponta para UserContext valido na stack do handler.
     let ctx_ref = unsafe { &*ctx };
@@ -99,7 +99,7 @@ unsafe extern "sysv64" fn fault_no_err_entry() {
 /// `timer`, que sinaliza a notification armada, e manda EOI ao LAPIC.
 /// Nao modifica o `UserContext` do interrompido: ring 3 retoma com
 /// estado identico, e so descobre o evento via `poll_notify`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "sysv64" fn timer_irq_dispatch() {
     crate::kobj::timer::fire();
     super::lapic::eoi();
