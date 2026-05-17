@@ -363,7 +363,15 @@ pub struct EfiFileInfo {
 // Helpers de alto nível
 // -----------------------
 
-pub fn get_memory_map_real(
+/// # Safety
+///
+/// Caller deve garantir:
+/// - `bs` aponta para `EfiBootServices` valido (em LoaderData ainda
+///   mapeada).
+/// - `buffer` aponta para regiao com pelo menos `buffer_len` bytes,
+///   alocada via `AllocatePool`, valida para escrita pelo firmware.
+/// - Chamada antes de `ExitBootServices`.
+pub unsafe fn get_memory_map_real(
     bs: NonNull<EfiBootServices>,
     buffer: *mut EfiMemoryDescriptor,
     buffer_len: usize,
@@ -811,7 +819,10 @@ fn locate_framebuffer(bs: NonNull<EfiBootServices>) -> Option<FramebufferInfo> {
 /// falhar ao retornar, então a única informação útil é a mensagem no serial.
 fn bail(msg: &str) -> ! {
     serial::write_str(msg);
-    loop {}
+    // hint para a CPU: spin loop sem queimar IPC.
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 /// Entry point UEFI interno, chamado pelo binário.
@@ -822,7 +833,13 @@ fn bail(msg: &str) -> ! {
 /// 3. carregar `kernel.elf` da ESP, validar ELF e (opcionalmente) hash;
 /// 4. alocar stack, construir identity page tables 4 KiB sobre kernel+stack;
 /// 5. obter memory map, chamar ExitBootServices, saltar para o entry do kernel.
-pub extern "efiapi" fn efi_entry(image: EfiHandle, system_table: *mut EfiSystemTable) -> ! {
+///
+/// # Safety
+///
+/// `system_table` deve ser o ponteiro entregue pela firmware UEFI
+/// (valido, em LoaderData) ou nulo (caso em que a funcao aborta).
+/// Tudo o mais (kernel.elf valido na ESP, etc) e validado em runtime.
+pub unsafe extern "efiapi" fn efi_entry(image: EfiHandle, system_table: *mut EfiSystemTable) -> ! {
     serial::init();
     serial::write_str("[boot] efi_entry\n");
 
@@ -917,11 +934,16 @@ pub extern "efiapi" fn efi_entry(image: EfiHandle, system_table: *mut EfiSystemT
 
     // Captura final da memory map. `map_key` aqui DEVE ser usado sem
     // qualquer alocacao intermediaria ate ExitBootServices.
-    let (mem_map, map_key, _desc_size) = match get_memory_map_real(
-        bs,
-        map_buf.as_ptr() as *mut EfiMemoryDescriptor,
-        map_buf_len,
-    ) {
+    // SAFETY: `bs` valido (NonNull verificado no inicio); `map_buf`
+    // alocado via AllocatePool com `map_buf_len` bytes; pre
+    // ExitBootServices.
+    let (mem_map, map_key, _desc_size) = match unsafe {
+        get_memory_map_real(
+            bs,
+            map_buf.as_ptr() as *mut EfiMemoryDescriptor,
+            map_buf_len,
+        )
+    } {
         Ok(t) => t,
         Err(_) => bail("[boot] erro: GetMemoryMap falhou\n"),
     };
