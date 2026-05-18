@@ -78,13 +78,13 @@ static SLOTS: [Slot; MAX_NOTIFICATIONS] = [const {
 /// Aloca um Notification object. CAS no `in_use` garante atomicidade
 /// mesmo que algum dia rodemos SMP. Signalword zerado no ato.
 pub fn create() -> Result<NotifyHandle, NotifyError> {
-    for i in 0..MAX_NOTIFICATIONS {
-        if SLOTS[i]
+    for (i, slot) in SLOTS.iter().enumerate() {
+        if slot
             .in_use
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
-            SLOTS[i].signalword.store(0, Ordering::Release);
+            slot.signalword.store(0, Ordering::Release);
             return Ok(NotifyHandle(i as u8));
         }
     }
