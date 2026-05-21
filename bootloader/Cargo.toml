@@ -15,6 +15,14 @@ path = "src/lib.rs"
 [[bin]]
 name = "bootloader"
 path = "src/main.rs"
+# Bin = `no_std + no_main + #[panic_handler]` (target uefi). Em test build
+# (`cargo test`/`cargo clippy --all-targets`), o harness do test injeta `std`
+# que ja define `panic_impl` -> duplicate lang item. Bin nao tem testes
+# (logica testavel vive em [lib]); desabilitar tests do bin resolve sem
+# remover o panic handler real.
+test = false
+bench = false
+doctest = false
 
 [dependencies]
 bootinfo = { path = "../crates/bootinfo" }
