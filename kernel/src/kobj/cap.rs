@@ -122,7 +122,9 @@ impl Default for CapTable {
 
 impl CapTable {
     pub const fn new() -> Self {
-        Self { entries: [CapEntry::Empty; CAP_SLOTS] }
+        Self {
+            entries: [CapEntry::Empty; CAP_SLOTS],
+        }
     }
 
     /// Cria um cap raiz (sem parent) em `slot`. Uso tipico: boot entrega
@@ -150,12 +152,7 @@ impl CapTable {
 
     /// Deriva `src` em `dst` com `rights` atenuados. Falha se `dst` ocupado
     /// ou se `rights` nao for subconjunto dos direitos de `src`.
-    pub fn copy(
-        &mut self,
-        src: CapSlot,
-        dst: CapSlot,
-        rights: CapRights,
-    ) -> Result<(), CapError> {
+    pub fn copy(&mut self, src: CapSlot, dst: CapSlot, rights: CapRights) -> Result<(), CapError> {
         self.check_range(src)?;
         self.check_range(dst)?;
         if src == dst {
@@ -215,9 +212,7 @@ impl CapTable {
             CapEntry::Empty => return Err(CapError::SlotEmpty),
         };
         // Bounds check com overflow-safe.
-        let end = offset
-            .checked_add(size)
-            .ok_or(CapError::InvalidRetype)?;
+        let end = offset.checked_add(size).ok_or(CapError::InvalidRetype)?;
         if end > parent_size {
             return Err(CapError::InvalidRetype);
         }
@@ -251,7 +246,10 @@ impl CapTable {
             }
             sib = s_next;
         }
-        let child_object = CapObject::Untyped { base: new_base, size };
+        let child_object = CapObject::Untyped {
+            base: new_base,
+            size,
+        };
         self.link_child(src, dst, child_object, rights);
         Ok(())
     }
@@ -317,13 +315,7 @@ impl CapTable {
 
     /// Insere `dst` como primeiro filho de `parent` na CDT. `dst` deve
     /// estar vazio. Atualiza o sibling-chain de `parent`.
-    fn link_child(
-        &mut self,
-        parent: CapSlot,
-        dst: CapSlot,
-        object: CapObject,
-        rights: CapRights,
-    ) {
+    fn link_child(&mut self, parent: CapSlot, dst: CapSlot, object: CapObject, rights: CapRights) {
         let old_first = match self.entries[parent as usize] {
             CapEntry::Cap { first_child, .. } => first_child,
             CapEntry::Empty => NULL_SLOT, // nao deveria acontecer; validado antes
@@ -350,7 +342,13 @@ impl CapTable {
     /// `slot` nao tem filhos (senao vira dangling).
     fn unlink_and_clear(&mut self, slot: CapSlot) -> Result<(), CapError> {
         let (parent, prev, next) = match self.entries[slot as usize] {
-            CapEntry::Cap { parent, prev_sibling, next_sibling, first_child, .. } => {
+            CapEntry::Cap {
+                parent,
+                prev_sibling,
+                next_sibling,
+                first_child,
+                ..
+            } => {
                 debug_assert_eq!(first_child, NULL_SLOT);
                 (parent, prev_sibling, next_sibling)
             }
@@ -392,9 +390,14 @@ mod tests {
     #[test]
     fn insert_root_occupies_slot() {
         let mut t = CapTable::new();
-        assert!(t.insert_root(0, mk_untyped(0, 4096), CapRights::ALL).is_ok());
-        assert_eq!(t.insert_root(0, mk_untyped(0, 4096), CapRights::ALL),
-                   Err(CapError::SlotOccupied));
+        assert!(
+            t.insert_root(0, mk_untyped(0, 4096), CapRights::ALL)
+                .is_ok()
+        );
+        assert_eq!(
+            t.insert_root(0, mk_untyped(0, 4096), CapRights::ALL),
+            Err(CapError::SlotOccupied)
+        );
     }
 
     #[test]
@@ -409,7 +412,8 @@ mod tests {
     #[test]
     fn copy_attenuates_rights() {
         let mut t = CapTable::new();
-        t.insert_root(0, mk_untyped(0, 4096), CapRights::ALL).unwrap();
+        t.insert_root(0, mk_untyped(0, 4096), CapRights::ALL)
+            .unwrap();
         t.copy(0, 1, CapRights::READ).unwrap();
         let (_, r) = t.lookup(1).unwrap();
         assert_eq!(r, CapRights::READ);
@@ -418,7 +422,8 @@ mod tests {
     #[test]
     fn copy_rejects_exceeding_rights() {
         let mut t = CapTable::new();
-        t.insert_root(0, mk_untyped(0, 4096), CapRights::READ).unwrap();
+        t.insert_root(0, mk_untyped(0, 4096), CapRights::READ)
+            .unwrap();
         assert_eq!(
             t.copy(0, 1, CapRights::ALL),
             Err(CapError::InsufficientRights)
@@ -428,7 +433,8 @@ mod tests {
     #[test]
     fn delete_with_children_fails() {
         let mut t = CapTable::new();
-        t.insert_root(0, mk_untyped(0, 4096), CapRights::ALL).unwrap();
+        t.insert_root(0, mk_untyped(0, 4096), CapRights::ALL)
+            .unwrap();
         t.copy(0, 1, CapRights::READ).unwrap();
         assert_eq!(t.delete(0), Err(CapError::HasChildren));
     }
@@ -436,7 +442,8 @@ mod tests {
     #[test]
     fn delete_leaf_clears_slot() {
         let mut t = CapTable::new();
-        t.insert_root(0, mk_untyped(0, 4096), CapRights::ALL).unwrap();
+        t.insert_root(0, mk_untyped(0, 4096), CapRights::ALL)
+            .unwrap();
         t.copy(0, 1, CapRights::READ).unwrap();
         t.delete(1).unwrap();
         assert_eq!(t.lookup(1), Err(CapError::SlotEmpty));
@@ -447,7 +454,8 @@ mod tests {
     #[test]
     fn revoke_deletes_all_descendants_keeps_root() {
         let mut t = CapTable::new();
-        t.insert_root(0, mk_untyped(0, 8192), CapRights::ALL).unwrap();
+        t.insert_root(0, mk_untyped(0, 8192), CapRights::ALL)
+            .unwrap();
         t.copy(0, 1, CapRights::READ).unwrap();
         t.copy(0, 2, CapRights::READ).unwrap();
         t.copy(1, 3, CapRights::READ).unwrap();
@@ -455,14 +463,20 @@ mod tests {
         t.revoke(0).unwrap();
         assert!(t.lookup(0).is_ok(), "root must survive");
         for s in [1u16, 2, 3, 4] {
-            assert_eq!(t.lookup(s), Err(CapError::SlotEmpty), "slot {} should be empty", s);
+            assert_eq!(
+                t.lookup(s),
+                Err(CapError::SlotEmpty),
+                "slot {} should be empty",
+                s
+            );
         }
     }
 
     #[test]
     fn revoke_on_subtree_does_not_delete_siblings() {
         let mut t = CapTable::new();
-        t.insert_root(0, mk_untyped(0, 8192), CapRights::ALL).unwrap();
+        t.insert_root(0, mk_untyped(0, 8192), CapRights::ALL)
+            .unwrap();
         t.copy(0, 1, CapRights::READ).unwrap(); // child 1
         t.copy(0, 2, CapRights::READ).unwrap(); // child 2
         t.copy(1, 3, CapRights::READ).unwrap(); // grandchild of 1
@@ -476,7 +490,8 @@ mod tests {
     fn retype_respects_libos_offset() {
         // LibOS chooses offset=0: child lies at parent.base.
         let mut t = CapTable::new();
-        t.insert_root(0, mk_untyped(0x1000, 0x4000), CapRights::ALL).unwrap();
+        t.insert_root(0, mk_untyped(0x1000, 0x4000), CapRights::ALL)
+            .unwrap();
         t.retype_untyped(0, 1, 0, 0x1000).unwrap();
         match t.lookup(1).unwrap().0 {
             CapObject::Untyped { base, size } => {
@@ -490,7 +505,8 @@ mod tests {
     #[test]
     fn retype_siblings_do_not_alias_with_explicit_offsets() {
         let mut t = CapTable::new();
-        t.insert_root(0, mk_untyped(0x1000, 0x4000), CapRights::ALL).unwrap();
+        t.insert_root(0, mk_untyped(0x1000, 0x4000), CapRights::ALL)
+            .unwrap();
         t.retype_untyped(0, 1, 0x0000, 0x1000).unwrap(); // [0x1000,0x2000)
         t.retype_untyped(0, 2, 0x1000, 0x1000).unwrap(); // [0x2000,0x3000)
         let b1 = match t.lookup(1).unwrap().0 {
@@ -510,7 +526,8 @@ mod tests {
         // LibOS maliciosa tenta criar filho sobre regiao ja alocada.
         // Kernel DEVE rejeitar para nao permitir alias nao-rastreado.
         let mut t = CapTable::new();
-        t.insert_root(0, mk_untyped(0x1000, 0x4000), CapRights::ALL).unwrap();
+        t.insert_root(0, mk_untyped(0x1000, 0x4000), CapRights::ALL)
+            .unwrap();
         t.retype_untyped(0, 1, 0x0000, 0x2000).unwrap(); // [0x1000,0x3000)
         assert_eq!(
             t.retype_untyped(0, 2, 0x1000, 0x1000), // [0x2000,0x3000) overlap
@@ -527,7 +544,8 @@ mod tests {
     #[test]
     fn retype_exceeds_parent_size() {
         let mut t = CapTable::new();
-        t.insert_root(0, mk_untyped(0x1000, 0x2000), CapRights::ALL).unwrap();
+        t.insert_root(0, mk_untyped(0x1000, 0x2000), CapRights::ALL)
+            .unwrap();
         assert_eq!(
             t.retype_untyped(0, 1, 0x1800, 0x1000),
             Err(CapError::InvalidRetype),
@@ -538,18 +556,17 @@ mod tests {
     #[test]
     fn retype_zero_size_rejected() {
         let mut t = CapTable::new();
-        t.insert_root(0, mk_untyped(0x1000, 0x4000), CapRights::ALL).unwrap();
-        assert_eq!(
-            t.retype_untyped(0, 1, 0, 0),
-            Err(CapError::InvalidRetype)
-        );
+        t.insert_root(0, mk_untyped(0x1000, 0x4000), CapRights::ALL)
+            .unwrap();
+        assert_eq!(t.retype_untyped(0, 1, 0, 0), Err(CapError::InvalidRetype));
     }
 
     #[test]
     fn retype_offset_overflow_rejected() {
         // Defesa contra overflow em offset+size.
         let mut t = CapTable::new();
-        t.insert_root(0, mk_untyped(0x1000, 0x4000), CapRights::ALL).unwrap();
+        t.insert_root(0, mk_untyped(0x1000, 0x4000), CapRights::ALL)
+            .unwrap();
         assert_eq!(
             t.retype_untyped(0, 1, u64::MAX, 1),
             Err(CapError::InvalidRetype)
@@ -559,7 +576,8 @@ mod tests {
     #[test]
     fn revoke_frees_region_for_new_retype() {
         let mut t = CapTable::new();
-        t.insert_root(0, mk_untyped(0x1000, 0x4000), CapRights::ALL).unwrap();
+        t.insert_root(0, mk_untyped(0x1000, 0x4000), CapRights::ALL)
+            .unwrap();
         t.retype_untyped(0, 1, 0x0000, 0x2000).unwrap();
         t.retype_untyped(0, 2, 0x2000, 0x1000).unwrap();
         t.revoke(0).unwrap();
@@ -574,7 +592,8 @@ mod tests {
     #[test]
     fn retype_on_non_untyped_rejected() {
         let mut t = CapTable::new();
-        t.insert_root(0, CapObject::Frame { phys: 0x1000 }, CapRights::ALL).unwrap();
+        t.insert_root(0, CapObject::Frame { phys: 0x1000 }, CapRights::ALL)
+            .unwrap();
         assert_eq!(
             t.retype_untyped(0, 1, 0, 0x1000),
             Err(CapError::WrongType),
@@ -588,7 +607,8 @@ mod tests {
         // Exercita recursao em profundidade; se mudarmos para iterativo,
         // este teste continua servindo como sanidade de linearizacao.
         let mut t = CapTable::new();
-        t.insert_root(0, mk_untyped(0, 65536), CapRights::ALL).unwrap();
+        t.insert_root(0, mk_untyped(0, 65536), CapRights::ALL)
+            .unwrap();
         for i in 1..64u16 {
             t.copy(i - 1, i, CapRights::ALL).unwrap();
         }
@@ -601,7 +621,10 @@ mod tests {
     #[test]
     fn lookup_out_of_range() {
         let t = CapTable::new();
-        assert_eq!(t.lookup(CAP_SLOTS as CapSlot), Err(CapError::SlotOutOfRange));
+        assert_eq!(
+            t.lookup(CAP_SLOTS as CapSlot),
+            Err(CapError::SlotOutOfRange)
+        );
     }
 
     #[test]
@@ -610,8 +633,10 @@ mod tests {
         // tentar derivar b com WRITE a partir de a falharia? Sim: a nao tem
         // WRITE se atribuimos so READ. Verifica que a atenuacao acumula.
         let mut t = CapTable::new();
-        t.insert_root(0, mk_untyped(0, 4096), CapRights::ALL).unwrap();
-        t.copy(0, 1, CapRights(CapRights::READ.0 | CapRights::WRITE.0)).unwrap();
+        t.insert_root(0, mk_untyped(0, 4096), CapRights::ALL)
+            .unwrap();
+        t.copy(0, 1, CapRights(CapRights::READ.0 | CapRights::WRITE.0))
+            .unwrap();
         t.copy(1, 2, CapRights::READ).unwrap();
         assert_eq!(
             t.copy(2, 3, CapRights::WRITE),
@@ -624,22 +649,17 @@ mod tests {
     #[test]
     fn copy_from_empty_slot_fails() {
         let mut t = CapTable::new();
-        assert_eq!(
-            t.copy(0, 1, CapRights::READ),
-            Err(CapError::SlotEmpty)
-        );
+        assert_eq!(t.copy(0, 1, CapRights::READ), Err(CapError::SlotEmpty));
     }
 
     #[test]
     fn copy_src_equal_dst_rejected() {
         let mut t = CapTable::new();
-        t.insert_root(0, mk_untyped(0, 4096), CapRights::ALL).unwrap();
+        t.insert_root(0, mk_untyped(0, 4096), CapRights::ALL)
+            .unwrap();
         // Aliasing src=dst e malicioso (cria loop na CDT). A API
         // rejeita com SlotOccupied (semantica conservadora).
-        assert_eq!(
-            t.copy(0, 0, CapRights::READ),
-            Err(CapError::SlotOccupied)
-        );
+        assert_eq!(t.copy(0, 0, CapRights::READ), Err(CapError::SlotOccupied));
     }
 
     #[test]
@@ -651,7 +671,8 @@ mod tests {
     #[test]
     fn double_revoke_is_idempotent_after_first() {
         let mut t = CapTable::new();
-        t.insert_root(0, mk_untyped(0, 4096), CapRights::ALL).unwrap();
+        t.insert_root(0, mk_untyped(0, 4096), CapRights::ALL)
+            .unwrap();
         t.copy(0, 1, CapRights::READ).unwrap();
         t.revoke(0).unwrap();
         // Apos primeiro revoke, raiz nao tem mais filhos. Segundo
@@ -710,19 +731,20 @@ mod tests {
     #[test]
     fn copy_on_occupied_slot_fails() {
         let mut t = CapTable::new();
-        t.insert_root(0, mk_untyped(0, 4096), CapRights::ALL).unwrap();
-        t.insert_root(1, mk_untyped(0x2000, 4096), CapRights::ALL).unwrap();
-        assert_eq!(
-            t.copy(0, 1, CapRights::READ),
-            Err(CapError::SlotOccupied)
-        );
+        t.insert_root(0, mk_untyped(0, 4096), CapRights::ALL)
+            .unwrap();
+        t.insert_root(1, mk_untyped(0x2000, 4096), CapRights::ALL)
+            .unwrap();
+        assert_eq!(t.copy(0, 1, CapRights::READ), Err(CapError::SlotOccupied));
     }
 
     #[test]
     fn retype_on_occupied_dst_slot_fails() {
         let mut t = CapTable::new();
-        t.insert_root(0, mk_untyped(0, 0x4000), CapRights::ALL).unwrap();
-        t.insert_root(1, mk_untyped(0x10_0000, 0x1000), CapRights::ALL).unwrap();
+        t.insert_root(0, mk_untyped(0, 0x4000), CapRights::ALL)
+            .unwrap();
+        t.insert_root(1, mk_untyped(0x10_0000, 0x1000), CapRights::ALL)
+            .unwrap();
         assert_eq!(
             t.retype_untyped(0, 1, 0, 0x1000),
             Err(CapError::SlotOccupied)
@@ -733,9 +755,10 @@ mod tests {
     fn retype_on_child_uses_child_base() {
         // Child has its own space; grandchild lies at [child.base + offset, ...).
         let mut t = CapTable::new();
-        t.insert_root(0, mk_untyped(0x0000, 0x8000), CapRights::ALL).unwrap();
+        t.insert_root(0, mk_untyped(0x0000, 0x8000), CapRights::ALL)
+            .unwrap();
         t.retype_untyped(0, 1, 0x2000, 0x2000).unwrap(); // child at [0x2000,0x4000)
-        t.retype_untyped(1, 2, 0, 0x1000).unwrap();      // grandchild at [0x2000,0x3000)
+        t.retype_untyped(1, 2, 0, 0x1000).unwrap(); // grandchild at [0x2000,0x3000)
         match t.lookup(2).unwrap().0 {
             CapObject::Untyped { base, .. } => assert_eq!(base, 0x2000),
             _ => unreachable!("test only creates Untyped"),
