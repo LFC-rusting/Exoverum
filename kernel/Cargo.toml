@@ -10,6 +10,11 @@ build = "build.rs"
 [[bin]]
 name = "kernel"
 path = "src/main.rs"
+# Mesma justificativa do bootloader: bin tem `#[panic_handler]` proprio que
+# colide com `std::panic_impl` em test builds. Logica testavel vive em [lib].
+test = false
+bench = false
+doctest = false
 
 [dependencies]
 bootinfo = { path = "../crates/bootinfo" }
