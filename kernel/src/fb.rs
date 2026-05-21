@@ -1,6 +1,9 @@
 //! Framebuffer minimo: rotulos textuais `[OK] <fase>.` em fonte 8x8
 //! embutida, escala 2x. Prova visual de progresso em bare metal.
 //!
+//! Stability: **EXPERIMENTAL** (scaffolding de validacao visual; pode ser
+//! removido sem perda funcional). Audit log: `docs/UNSAFE.md`.
+//!
 //! Fluxo: `init_from_bootinfo` (antes de paging) guarda info crua;
 //! `remap_after_paging` mapeia MMIO, limpa tela e imprime cabecalho;
 //! `mark(n)`/`mark_halt(n)` imprimem uma linha fixa por fase. Sem
