@@ -1,5 +1,8 @@
 //! Alocador de frames fisicos (4 KiB) baseado em bitmap.
 //!
+//! Stability: **STABLE** (logica host-testavel cobre invariantes do bitmap).
+//! Audit log: `docs/UNSAFE.md`.
+//!
 //! # Design
 //!
 //! - Um bitmap estatico `[u64; BITMAP_WORDS]` em `.bss` cobrindo ate
@@ -328,7 +331,10 @@ mod tests {
     fn init_rejects_small_desc_size() {
         let mut a = FrameAllocator::empty();
         let buf = vec![0u8; 32];
-        assert_eq!(a.init(&buf, 32, &[]), Err(FrameError::InvalidDescriptorSize));
+        assert_eq!(
+            a.init(&buf, 32, &[]),
+            Err(FrameError::InvalidDescriptorSize)
+        );
     }
 
     #[test]
@@ -358,7 +364,11 @@ mod tests {
         assert_eq!(a.free_count(), 256);
         // E nenhuma alocacao pode devolver endereco < 1 MiB.
         let f = a.alloc().unwrap();
-        assert!(f.addr() >= 0x100000, "allocated frame in low memory: {:#x}", f.addr());
+        assert!(
+            f.addr() >= 0x100000,
+            "allocated frame in low memory: {:#x}",
+            f.addr()
+        );
     }
 
     #[test]
@@ -377,7 +387,10 @@ mod tests {
         // 8 paginas em 0x10000; reservamos 2 delas.
         let (buf, ds) = build_map(&[(EFI_CONVENTIONAL_MEMORY, 0x100000, 8)]);
         let mut a = FrameAllocator::empty();
-        let reserved = [PhysRange { start: 0x100000, end: 0x102000 }];
+        let reserved = [PhysRange {
+            start: 0x100000,
+            end: 0x102000,
+        }];
         a.init(&buf, ds, &reserved).unwrap();
         assert_eq!(a.free_count(), 6);
     }
