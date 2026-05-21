@@ -3,6 +3,9 @@
 //! Apenas o entry `kernel_start`; toda a logica vive na biblioteca `kernel`
 //! (src/lib.rs). Isso permite testar modulos safe no host sem precisar do
 //! entry bare-metal.
+//!
+//! Stability: **STABLE** (entry shim; ABI sysv64 fixa). Audit log:
+//! `docs/UNSAFE.md`.
 
 #![no_std]
 #![no_main]
