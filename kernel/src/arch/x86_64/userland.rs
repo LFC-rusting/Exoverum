@@ -1,5 +1,8 @@
 //! Entrada/saida de ring 3 e syscall dispatch.
 //!
+//! Stability: **EXPERIMENTAL** (numeracao de syscalls e formato do
+//! `UserContext` podem evoluir antes do v0.1.0). Audit log: `docs/UNSAFE.md`.
+//!
 //! # Trafego ring 3 <-> kernel
 //!
 //! - **Entrada inicial:** `enter_ring3` faz `iretq` sintetico (kernel
@@ -26,10 +29,10 @@
 
 use core::arch::global_asm;
 
+use super::serial as log;
 use crate::arch::x86_64::cpu;
 use crate::arch::x86_64::gdt::{USER_CS, USER_DS};
 use crate::kobj::domain;
-use super::serial as log;
 
 // =================================================================
 // UserContext
@@ -75,10 +78,21 @@ impl UserContext {
     /// dominio pela primeira vez.
     pub const fn fresh(rip: u64, rsp: u64) -> Self {
         Self {
-            rax: 0, rbx: 0, rcx: 0, rdx: 0,
-            rsi: 0, rdi: 0, rbp: 0,
-            r8: 0, r9: 0, r10: 0, r11: 0,
-            r12: 0, r13: 0, r14: 0, r15: 0,
+            rax: 0,
+            rbx: 0,
+            rcx: 0,
+            rdx: 0,
+            rsi: 0,
+            rdi: 0,
+            rbp: 0,
+            r8: 0,
+            r9: 0,
+            r10: 0,
+            r11: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
             rip,
             cs: USER_CS as u64,
             // RFLAGS bit 1 reservado=1, IF=0 (kernel nao configura
