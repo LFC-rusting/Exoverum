@@ -37,3 +37,6 @@ build-bootloader-release = "build -p bootloader --release"
 # Testes de host: apenas a lib do bootloader (a bin tem `#[no_main]` e so
 # linka em UEFI). Kernel segue o mesmo padrao quando ganhar testes de host.
 test-host = "test --lib -p bootloader -p bootinfo -p kernel --target x86_64-unknown-linux-gnu"
+# Miri sobre os modulos host-testaveis. Requer toolchain nightly com
+# componente `miri` (`rustup +nightly component add miri`).
+miri-host = "+nightly miri test --lib -p bootloader -p bootinfo -p kernel --target x86_64-unknown-linux-gnu"
