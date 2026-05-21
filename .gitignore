@@ -2,7 +2,7 @@
 /target/
 
 # Diretórios internos
-.windsurf/
+/.vscode/
 /docs/
 
 # Arquivos temporários de editor/SO
