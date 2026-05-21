@@ -1,5 +1,7 @@
 //! Camada UEFI: FFI mínimo e fluxo de boot `efi_entry`.
 //!
+//! Stability: **STABLE** (UEFI Spec 2.x ABI). Audit log: `docs/UNSAFE.md`.
+//!
 //! Todo o `unsafe` do bootloader está concentrado aqui e em `serial`. Cada bloco
 //! `unsafe` carrega um comentário SAFETY. Sempre que possível delegamos parsing
 //! e verificação para o núcleo safe (`crate::elf`, `crate::crypto`).
@@ -11,14 +13,11 @@ use core::ptr::NonNull;
 use core::slice;
 
 use crate::{
-    build_bootinfo,
+    BootError, KernelImage, PhysRange, build_bootinfo,
+    elf::{PT_LOAD, kernel_entry_from_elf, kernel_phys_range_from_elf, parse_elf_header, parse_ph},
     embedded_kernel_sha256,
-    elf::{kernel_entry_from_elf, kernel_phys_range_from_elf, parse_elf_header, parse_ph, PT_LOAD},
     platform::serial,
     process_kernel_image,
-    BootError,
-    KernelImage,
-    PhysRange,
 };
 
 // -----------------------
@@ -103,7 +102,10 @@ pub struct EfiSystemTable {
 #[repr(C)]
 pub struct EfiSimpleTextOutputProtocol {
     pub reset: usize,
-    pub output_string: unsafe extern "efiapi" fn(this: *mut EfiSimpleTextOutputProtocol, string: *const u16) -> Status,
+    pub output_string: unsafe extern "efiapi" fn(
+        this: *mut EfiSimpleTextOutputProtocol,
+        string: *const u16,
+    ) -> Status,
     pub test_string: usize,
     pub query_mode: usize,
     pub set_mode: usize,
@@ -143,7 +145,8 @@ pub struct EfiBootServices {
         descriptor_size: *mut usize,
         descriptor_version: *mut u32,
     ) -> Status,
-    pub allocate_pool: unsafe extern "efiapi" fn(pool_type: u32, size: usize, buf: *mut *mut c_void) -> Status,
+    pub allocate_pool:
+        unsafe extern "efiapi" fn(pool_type: u32, size: usize, buf: *mut *mut c_void) -> Status,
     pub free_pool: unsafe extern "efiapi" fn(buf: *mut c_void) -> Status,
     // Event & Timer Services
     pub create_event: usize,
@@ -167,7 +170,8 @@ pub struct EfiBootServices {
     pub start_image: usize,
     pub exit: usize,
     pub unload_image: usize,
-    pub exit_boot_services: unsafe extern "efiapi" fn(image_handle: EfiHandle, map_key: usize) -> Status,
+    pub exit_boot_services:
+        unsafe extern "efiapi" fn(image_handle: EfiHandle, map_key: usize) -> Status,
     // Misc Services
     pub get_next_monotonic_count: usize,
     pub stall: usize,
@@ -285,14 +289,13 @@ pub const EFI_ALLOCATE_MAX_ADDRESS: u32 = 1;
 pub const EFI_ALLOCATE_ADDRESS: u32 = 2;
 
 pub const KERNEL_PATH_UTF16: [u16; 21] = [
-    0x005c, 0x0045, 0x0046, 0x0049, 0x005c, 0x0042, 0x004f, 0x004f, 0x0054, 0x005c,
-    0x006b, 0x0065, 0x0072, 0x006e, 0x0065, 0x006c, 0x002e, 0x0065, 0x006c, 0x0066,
-    0x0000,
+    0x005c, 0x0045, 0x0046, 0x0049, 0x005c, 0x0042, 0x004f, 0x004f, 0x0054, 0x005c, 0x006b, 0x0065,
+    0x0072, 0x006e, 0x0065, 0x006c, 0x002e, 0x0065, 0x006c, 0x0066, 0x0000,
 ];
 
 const BOOT_MSG_OK: [u16; 15] = [
-    0x005b, 0x004f, 0x004b, 0x005d, 0x0020, 0x0042, 0x006f, 0x006f, 0x0074, 0x006c, 0x006f,
-    0x0061, 0x0064, 0x000d, 0x0000,
+    0x005b, 0x004f, 0x004b, 0x005d, 0x0020, 0x0042, 0x006f, 0x006f, 0x0074, 0x006c, 0x006f, 0x0061,
+    0x0064, 0x000d, 0x0000,
 ];
 
 #[repr(C)]
@@ -333,7 +336,11 @@ pub struct EfiFileProtocol {
     ) -> Status,
     pub close: unsafe extern "efiapi" fn(this: *mut EfiFileProtocol) -> Status,
     pub delete: usize,
-    pub read: unsafe extern "efiapi" fn(this: *mut EfiFileProtocol, buffer_size: *mut usize, buffer: *mut c_void) -> Status,
+    pub read: unsafe extern "efiapi" fn(
+        this: *mut EfiFileProtocol,
+        buffer_size: *mut usize,
+        buffer: *mut c_void,
+    ) -> Status,
     pub write: usize,
     pub get_position: usize,
     pub set_position: usize,
@@ -413,14 +420,25 @@ pub fn load_kernel_real(
     image_handle: EfiHandle,
     path_utf16: &[u16],
 ) -> Result<&'static [u8], BootError> {
-    let loaded = open_protocol::<EfiLoadedImageProtocol>(bs, image_handle, &EFI_LOADED_IMAGE_PROTOCOL_GUID, image_handle)?;
+    let loaded = open_protocol::<EfiLoadedImageProtocol>(
+        bs,
+        image_handle,
+        &EFI_LOADED_IMAGE_PROTOCOL_GUID,
+        image_handle,
+    )?;
     // SAFETY: `loaded` veio de OpenProtocol com sucesso; campos do protocolo são válidos enquanto não fechado.
     let device = unsafe { loaded.as_ref().device_handle };
-    let sfs = open_protocol::<EfiSimpleFileSystemProtocol>(bs, device, &EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID, image_handle)?;
+    let sfs = open_protocol::<EfiSimpleFileSystemProtocol>(
+        bs,
+        device,
+        &EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID,
+        image_handle,
+    )?;
 
     let mut root: *mut EfiFileProtocol = core::ptr::null_mut();
     // SAFETY: sfs válido; open_volume preenche `root` se retornar sucesso.
-    let status = unsafe { (sfs.as_ref().open_volume)(sfs.as_ptr(), &mut root as *mut *mut EfiFileProtocol) };
+    let status =
+        unsafe { (sfs.as_ref().open_volume)(sfs.as_ptr(), &mut root as *mut *mut EfiFileProtocol) };
     if !status_success(status) || root.is_null() {
         return Err(BootError::MissingKernel);
     }
@@ -447,7 +465,14 @@ pub fn load_kernel_real(
     // Descobrir tamanho via GetInfo (primeira chamada intencionalmente falha com BUFFER_TOO_SMALL).
     let mut info_size: usize = 0;
     // SAFETY: `file` válido; buffer nulo é permitido para consulta de tamanho.
-    let status = unsafe { ((*file).get_info)(file, &EFI_FILE_INFO_GUID, &mut info_size as *mut usize, core::ptr::null_mut()) };
+    let status = unsafe {
+        ((*file).get_info)(
+            file,
+            &EFI_FILE_INFO_GUID,
+            &mut info_size as *mut usize,
+            core::ptr::null_mut(),
+        )
+    };
     if !status_is_buffer_too_small(status) || info_size < mem::size_of::<EfiFileInfo>() {
         // SAFETY: handles ainda válidos; close é sempre seguro para limpar.
         unsafe {
@@ -459,7 +484,14 @@ pub fn load_kernel_real(
 
     let info_buf = allocate_pool(bs, info_size)?;
     // SAFETY: `info_buf` alocado via AllocatePool com `info_size` bytes.
-    let status = unsafe { ((*file).get_info)(file, &EFI_FILE_INFO_GUID, &mut info_size as *mut usize, info_buf.as_ptr()) };
+    let status = unsafe {
+        ((*file).get_info)(
+            file,
+            &EFI_FILE_INFO_GUID,
+            &mut info_size as *mut usize,
+            info_buf.as_ptr(),
+        )
+    };
     if !status_success(status) {
         // SAFETY: handles válidos; free_pool aceita ponteiro devolvido por AllocatePool.
         unsafe {
@@ -505,7 +537,8 @@ pub fn load_kernel_real(
 fn allocate_pool(bs: NonNull<EfiBootServices>, size: usize) -> Result<NonNull<c_void>, BootError> {
     let mut buf: *mut c_void = core::ptr::null_mut();
     // SAFETY: AllocatePool preenche `buf` com ponteiro válido em caso de sucesso.
-    let status = unsafe { (bs.as_ref().allocate_pool)(EFI_LOADER_DATA, size, &mut buf as *mut *mut c_void) };
+    let status =
+        unsafe { (bs.as_ref().allocate_pool)(EFI_LOADER_DATA, size, &mut buf as *mut *mut c_void) };
     if !status_success(status) || buf.is_null() {
         return Err(BootError::MissingKernel);
     }
@@ -547,10 +580,7 @@ fn allocate_pages_at(
 /// Assume que o ELF ja foi validado por `validate_kernel_elf`. Em falha nao
 /// desfaz alocacoes parciais (firmware as reclama apos ExitBootServices se
 /// houver; aqui tratamos como erro fatal e damos `bail`).
-pub fn load_elf_segments_real(
-    bs: NonNull<EfiBootServices>,
-    elf: &[u8],
-) -> Result<u64, BootError> {
+pub fn load_elf_segments_real(bs: NonNull<EfiBootServices>, elf: &[u8]) -> Result<u64, BootError> {
     let hdr = parse_elf_header(elf)?;
 
     // Aloca um unico bloco cobrindo toda a faixa fisica do kernel. Mais
@@ -559,9 +589,7 @@ pub fn load_elf_segments_real(
     let range = kernel_phys_range_from_elf(elf)?;
     let start = align_down(range.start, PAGE_SIZE);
     let end = align_up(range.end, PAGE_SIZE);
-    let total_bytes = end
-        .checked_sub(start)
-        .ok_or(BootError::InvalidElf)?;
+    let total_bytes = end.checked_sub(start).ok_or(BootError::InvalidElf)?;
     let pages = (total_bytes / PAGE_SIZE) as usize;
 
     allocate_pages_at(bs, start, pages, EFI_LOADER_CODE)?;
@@ -570,11 +598,7 @@ pub fn load_elf_segments_real(
     // Zero antes de copiar para que `.bss` (memsz > filesz) fique zerada
     // sem precisar de logica adicional por segmento.
     unsafe {
-        core::ptr::write_bytes(
-            start as *mut u8,
-            0,
-            total_bytes as usize,
-        );
+        core::ptr::write_bytes(start as *mut u8, 0, total_bytes as usize);
     }
 
     // Copia cada PT_LOAD para seu `p_paddr`.
@@ -593,11 +617,7 @@ pub fn load_elf_segments_real(
         // pertence a regiao do kernel; sem sobreposicao com `src` (pool
         // UEFI vs. memoria recem-alocada para o kernel).
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                elf.as_ptr().add(off),
-                ph.paddr as *mut u8,
-                sz,
-            );
+            core::ptr::copy_nonoverlapping(elf.as_ptr().add(off), ph.paddr as *mut u8, sz);
         }
     }
 
@@ -636,7 +656,12 @@ fn zero_page(bs: NonNull<EfiBootServices>) -> Result<NonNull<u64>, BootError> {
     // SAFETY: AllocatePages(AnyPages, LoaderData, 1) retorna endereco 4K-
     // alinhado em `addr` ou status != SUCCESS.
     let status = unsafe {
-        (bs.as_ref().allocate_pages)(EFI_ALLOCATE_ANY_PAGES, EFI_LOADER_DATA, 1, &mut addr as *mut u64)
+        (bs.as_ref().allocate_pages)(
+            EFI_ALLOCATE_ANY_PAGES,
+            EFI_LOADER_DATA,
+            1,
+            &mut addr as *mut u64,
+        )
     };
     if !status_success(status) || addr == 0 {
         return Err(BootError::PageTableUnavailable);
@@ -741,7 +766,9 @@ fn map_kernel_higher_half_inner(
 
         // SAFETY: `pt` vem de `ensure_subtable`, que só retorna PTs alocadas
         // por nós (zeradas) ou PTs já referenciadas pela cadeia. `i1` < 512.
-        unsafe { *pt.add(i1) = p | PTE_PRESENT | PTE_WRITABLE; }
+        unsafe {
+            *pt.add(i1) = p | PTE_PRESENT | PTE_WRITABLE;
+        }
         p += PAGE_SIZE;
     }
     Ok(())
@@ -763,7 +790,9 @@ fn ensure_subtable(
     let new = zero_page(bs)?.as_ptr();
     let new_phys = new as u64;
     // SAFETY: mesma justificativa de leitura; escrita de uma única entrada.
-    unsafe { *parent.add(idx) = new_phys | PTE_PRESENT | PTE_WRITABLE; }
+    unsafe {
+        *parent.add(idx) = new_phys | PTE_PRESENT | PTE_WRITABLE;
+    }
     Ok(new)
 }
 
@@ -811,7 +840,13 @@ fn locate_framebuffer(bs: NonNull<EfiBootServices>) -> Option<FramebufferInfo> {
     if format > 1 || base == 0 || width == 0 || height == 0 || pitch == 0 {
         return None;
     }
-    Some(FramebufferInfo { base, width, height, pitch, bpp: 32 })
+    Some(FramebufferInfo {
+        base,
+        width,
+        height,
+        pitch,
+        bpp: 32,
+    })
 }
 
 /// Aborta o boot logando a causa pelo serial e entrando em loop. Usada para
@@ -864,7 +899,10 @@ pub unsafe extern "efiapi" fn efi_entry(image: EfiHandle, system_table: *mut Efi
         Ok(h) => h,
         Err(_) => bail("[boot] error: embedded hash invalid\n"),
     };
-    let img = KernelImage { elf: kernel, expected_sha256 };
+    let img = KernelImage {
+        elf: kernel,
+        expected_sha256,
+    };
     if process_kernel_image(&img).is_err() {
         bail("[boot] error: invalid ELF or hash mismatch\n");
     }
@@ -981,4 +1019,3 @@ pub unsafe extern "efiapi" fn efi_entry(image: EfiHandle, system_table: *mut Efi
     //  - Identity map UEFI ainda ativo (ExitBootServices nao mexe em CR3).
     unsafe { entry_fn(&bootinfo as *const bootinfo::BootInfo) }
 }
-
