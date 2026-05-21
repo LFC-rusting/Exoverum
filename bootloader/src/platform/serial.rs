@@ -1,5 +1,8 @@
 //! Saída serial COM1 (write-only, sem input, sem parsing).
 //!
+//! Stability: **STABLE** (UART 16550 = padrao de facto). Audit log:
+//! `docs/UNSAFE.md`.
+//!
 //! Uso estrito para logs de boot/diagnóstico. Nunca escrevo dados sensíveis aqui.
 
 use core::arch::asm;
@@ -16,12 +19,12 @@ const UART_MCR: u16 = 4; // Modem Control Register
 const UART_LSR: u16 = 5; // Line Status Register (R)
 const UART_SCR: u16 = 7; // Scratch Register (R/W, sem efeito colateral)
 
-const LCR_DLAB: u8 = 0x80;           // habilita acesso ao divisor
-const LCR_8N1: u8 = 0x03;            // 8 bits, sem paridade, 1 stop bit
+const LCR_DLAB: u8 = 0x80; // habilita acesso ao divisor
+const LCR_8N1: u8 = 0x03; // 8 bits, sem paridade, 1 stop bit
 const FCR_ENABLE_CLEAR_14: u8 = 0xC7; // FIFO on, limpa RX/TX, threshold 14
-const MCR_DTR_RTS: u8 = 0x03;        // DTR + RTS
-const LSR_THR_EMPTY: u8 = 0x20;      // bit 5: transmitter holding register vazio
-const SCR_PROBE_PATTERN: u8 = 0xAE;  // valor arbitrário para teste de presença
+const MCR_DTR_RTS: u8 = 0x03; // DTR + RTS
+const LSR_THR_EMPTY: u8 = 0x20; // bit 5: transmitter holding register vazio
+const SCR_PROBE_PATTERN: u8 = 0xAE; // valor arbitrário para teste de presença
 
 /// Sinaliza se o UART respondeu ao teste de presença.
 /// Enquanto `false`, nenhuma função de escrita toca o hardware.
