@@ -2,6 +2,9 @@
 //!
 //! Fase 1: GDT, TSS, IDT, serial.
 //! Fase 2: alocador de frames fisicos (mm::frame).
+//!
+//! Stability: **EXPERIMENTAL** (orquestracao de demos; sera reduzida quando
+//! LibOS real assumir). Audit log: `docs/UNSAFE.md`.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -172,7 +175,13 @@ fn demo_userland() -> ! {
         Err(_) => fail("demo_userland: domain::create B failed"),
     };
 
-    setup_domain(dh_b, userland::payload_b_bytes(), None, PAYLOAD_VA, STACK_VA);
+    setup_domain(
+        dh_b,
+        userland::payload_b_bytes(),
+        None,
+        PAYLOAD_VA,
+        STACK_VA,
+    );
 
     let patch_off = userland::payload_a_target_imm_offset();
     setup_domain(
