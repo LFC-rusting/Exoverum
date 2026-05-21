@@ -1,5 +1,8 @@
 //! Primitivas x86_64 de baixo nivel (I/O ports, flags, halt).
 //!
+//! Stability: **STABLE** (Intel SDM Vol. 2 / 3 — semantica de `in`/`out`/
+//! `cli`/`sti`/`hlt`/`mov cr*` fixa). Audit log: `docs/UNSAFE.md`.
+//!
 //! Cada funcao expoe API safe externa e contem `unsafe` interno com SAFETY
 //! inline. Auditar este arquivo e suficiente para verificar a base de portas
 //! e asm inline do kernel.
@@ -43,21 +46,27 @@ pub fn inb(port: u16) -> u8 {
 pub fn cli() {
     // SAFETY: `cli` limpa IF; seguro em ring0. Deve ser usado em secoes
     // criticas curtas.
-    unsafe { asm!("cli", options(nomem, nostack, preserves_flags)); }
+    unsafe {
+        asm!("cli", options(nomem, nostack, preserves_flags));
+    }
 }
 
 /// Habilita interrupcoes no core atual.
 #[inline]
 pub fn sti() {
     // SAFETY: `sti` seta IF; seguro em ring0.
-    unsafe { asm!("sti", options(nomem, nostack, preserves_flags)); }
+    unsafe {
+        asm!("sti", options(nomem, nostack, preserves_flags));
+    }
 }
 
 /// Aguarda proxima interrupcao (usado em laco de halt).
 #[inline]
 pub fn hlt() {
     // SAFETY: `hlt` e privilegiada mas valida em ring0; aguarda IRQ/NMI.
-    unsafe { asm!("hlt", options(nomem, nostack, preserves_flags)); }
+    unsafe {
+        asm!("hlt", options(nomem, nostack, preserves_flags));
+    }
 }
 
 /// Para o core permanentemente. Chamado em panic e handlers de excecao.
