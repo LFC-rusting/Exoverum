@@ -1,5 +1,8 @@
 //! GDT + TSS para long mode x86_64.
 //!
+//! Stability: **STABLE** (Intel SDM Vol. 3 §3, §7 — formato fixo). Audit
+//! log: `docs/UNSAFE.md`.
+//!
 //! Layout da GDT (selectors entre parenteses; ordem fixada por SYSRET:
 //! ele exige user-data em STAR_HIGH+8 e user-code em STAR_HIGH+16, com
 //! STAR_HIGH = 0x10 implicando user-data 0x18 e user-code 0x20):
@@ -74,7 +77,10 @@ const _: () = {
     assert!((GDT_USER_DATA >> 44) & 1 == 1, "user data: S");
     // SYSRET impoe user-data = STAR_HIGH+8 e user-code = STAR_HIGH+16.
     // Se trocarmos a ordem da GDT, este assert falha antes do boot.
-    assert!(USER_CS as u64 - 3 == (USER_DS as u64 - 3) + 8, "SYSRET layout");
+    assert!(
+        USER_CS as u64 - 3 == (USER_DS as u64 - 3) + 8,
+        "SYSRET layout"
+    );
 };
 
 static mut GDT: [u64; GDT_LEN] = [
@@ -167,10 +173,8 @@ pub fn init() {
     // Calculo enderecos das statics; `addr_of(_mut)!` evita formar refs a
     // statics mutaveis e satisfaz o lint `static_mut_refs`.
     let tss_base = core::ptr::addr_of!(TSS) as u64;
-    let df_stack_top =
-        (core::ptr::addr_of!(DF_STACK) as u64) + IST_STACK_SIZE as u64;
-    let pf_stack_top =
-        (core::ptr::addr_of!(PF_STACK) as u64) + IST_STACK_SIZE as u64;
+    let df_stack_top = (core::ptr::addr_of!(DF_STACK) as u64) + IST_STACK_SIZE as u64;
+    let pf_stack_top = (core::ptr::addr_of!(PF_STACK) as u64) + IST_STACK_SIZE as u64;
 
     // SAFETY: `init` roda uma unica vez; nenhum reader concorrente de TSS
     // porque ainda nao carregamos a GDT nova. Escrita via ponteiro bruto
