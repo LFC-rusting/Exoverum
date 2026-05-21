@@ -33,7 +33,7 @@
 
 #![forbid(unsafe_code)]
 
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use super::notification::{self, NotifyHandle};
 
