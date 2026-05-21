@@ -1,5 +1,8 @@
 //! Construcao de page tables x86_64 4 KiB com W^X estrito.
 //!
+//! Stability: **STABLE** (formato de PTE fixo por Intel SDM Vol. 3 §4;
+//! invariantes W^X cobertas em host-tests). Audit log: `docs/UNSAFE.md`.
+//!
 //! # Modelo
 //!
 //! Trabalhamos apenas em nivel logico: cada `PageTable` e um `[u64; 512]`
@@ -28,7 +31,7 @@
 
 #![forbid(unsafe_code)]
 
-use crate::mm::frame::{PhysFrame, FRAME_SIZE};
+use crate::mm::frame::{FRAME_SIZE, PhysFrame};
 
 /// Bits do PTE em x86_64 (Intel SDM 3A 4.5).
 pub const PTE_PRESENT: u64 = 1 << 0;
@@ -77,13 +80,10 @@ impl Perm {
             Perm::Ro => PTE_PRESENT | PTE_NO_EXECUTE,
             Perm::Rw => PTE_PRESENT | PTE_WRITABLE | PTE_NO_EXECUTE,
             Perm::Mmio => {
-                PTE_PRESENT | PTE_WRITABLE | PTE_NO_EXECUTE
-                    | PTE_CACHE_DISABLE | PTE_WRITE_THROUGH
+                PTE_PRESENT | PTE_WRITABLE | PTE_NO_EXECUTE | PTE_CACHE_DISABLE | PTE_WRITE_THROUGH
             }
             Perm::UserRx => PTE_PRESENT | PTE_USER,
-            Perm::UserRw => {
-                PTE_PRESENT | PTE_USER | PTE_WRITABLE | PTE_NO_EXECUTE
-            }
+            Perm::UserRw => PTE_PRESENT | PTE_USER | PTE_WRITABLE | PTE_NO_EXECUTE,
         }
     }
 
@@ -102,7 +102,9 @@ pub struct PageTable {
 
 impl PageTable {
     pub const fn zeroed() -> Self {
-        Self { entries: [0u64; 512] }
+        Self {
+            entries: [0u64; 512],
+        }
     }
 }
 
@@ -189,7 +191,10 @@ mod tests {
     fn perm_flags_enforce_wx() {
         assert_eq!(Perm::Rx.flags(), PTE_PRESENT);
         assert_eq!(Perm::Ro.flags(), PTE_PRESENT | PTE_NO_EXECUTE);
-        assert_eq!(Perm::Rw.flags(), PTE_PRESENT | PTE_WRITABLE | PTE_NO_EXECUTE);
+        assert_eq!(
+            Perm::Rw.flags(),
+            PTE_PRESENT | PTE_WRITABLE | PTE_NO_EXECUTE
+        );
         // Invariante central: Rx nunca tem WRITABLE; Rw/Ro nunca tem executavel.
         assert_eq!(Perm::Rx.flags() & PTE_WRITABLE, 0);
         assert_ne!(Perm::Rw.flags() & PTE_NO_EXECUTE, 0);
@@ -304,4 +309,3 @@ mod tests {
         assert_eq!(pte_phys(pte) & 0xFFF, 0);
     }
 }
-
