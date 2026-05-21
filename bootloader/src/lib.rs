@@ -14,8 +14,8 @@
 
 use bootinfo::{BootInfo, FramebufferInfo, MemoryMap, PhysRange};
 
-pub mod elf;
 pub mod crypto;
+pub mod elf;
 pub mod platform;
 
 pub use elf::{kernel_entry_from_elf, kernel_phys_range_from_elf, validate_kernel_elf};
@@ -91,8 +91,7 @@ fn parse_sha256_hex(hex: &str) -> Result<[u8; 32], BootError> {
 /// Preenchido em tempo de compilação via variável de ambiente
 /// `EXOVERUM_KERNEL_SHA256` (hex com 64 caracteres).
 pub fn embedded_kernel_sha256() -> Result<[u8; 32], BootError> {
-    let hex = option_env!("EXOVERUM_KERNEL_SHA256")
-        .ok_or(BootError::HashMismatch)?;
+    let hex = option_env!("EXOVERUM_KERNEL_SHA256").ok_or(BootError::HashMismatch)?;
     parse_sha256_hex(hex)
 }
 
