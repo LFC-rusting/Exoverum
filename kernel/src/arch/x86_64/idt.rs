@@ -1,5 +1,8 @@
 //! IDT minima da Fase 1.
 //!
+//! Stability: **STABLE** (Intel SDM Vol. 3 §6 — gate descriptors fixos).
+//! Audit log: `docs/UNSAFE.md`.
+//!
 //! Objetivo: qualquer excecao do CPU causa um log pela serial e halt. Ainda
 //! nao diferencio vetor nem leio error code do stack; isso chega nas fases
 //! seguintes junto com o fluxo real de interrupcoes (LAPIC timer, syscall).
@@ -194,8 +197,7 @@ pub fn init() {
         // handler generico `h_no_err` que so halta: timer precisa
         // sinalizar notification + EOI + retornar.
         let timer_h = timer_irq_entry as *const () as usize as u64;
-        (*idt.add(super::lapic::TIMER_VECTOR as usize))
-            .set(timer_h, KERNEL_CS, 0, INTERRUPT_GATE);
+        (*idt.add(super::lapic::TIMER_VECTOR as usize)).set(timer_h, KERNEL_CS, 0, INTERRUPT_GATE);
     }
 
     let base = core::ptr::addr_of!(IDT) as u64;
