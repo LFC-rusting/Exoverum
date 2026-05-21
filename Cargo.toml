@@ -4,6 +4,10 @@ members = [
     "kernel",
     "crates/bootinfo",
 ]
+# `cargo build` no workspace root usa o target default (uefi). Kernel nao
+# linka como uefi (entry = kernel_start, nao efi_main). Limitar default
+# ao bootloader; kernel via alias `cargo build-kernel` ou via Makefile.
+default-members = ["bootloader"]
 resolver = "2"
 
 [workspace.package]
