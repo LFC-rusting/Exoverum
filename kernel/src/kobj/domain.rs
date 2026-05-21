@@ -1,5 +1,8 @@
 //! Dominios ring 3 com PCT sync, cap_grant e revocacao cross-CSpace.
 //!
+//! Stability: **EXPERIMENTAL** (CSpace flat v1; pode evoluir para CNode
+//! graph seL4-style sem mudar API publica). Audit log: `docs/UNSAFE.md`.
+//!
 //! # Modelo
 //!
 //! Um `Domain` agrega:
@@ -38,7 +41,7 @@ use core::cell::UnsafeCell;
 
 use crate::arch::x86_64::serial as log;
 use crate::arch::x86_64::userland::UserContext;
-use crate::kobj::cap::{CapError, CapObject, CapRights, CapSlot, CapTable, CAP_SLOTS};
+use crate::kobj::cap::{CAP_SLOTS, CapError, CapObject, CapRights, CapSlot, CapTable};
 use crate::kobj::notification::{self, NotifyHandle};
 use crate::kobj::timer;
 use crate::mm::{self, Perm};
@@ -190,9 +193,7 @@ pub unsafe fn create() -> Result<DomainHandle, DomainError> {
         .find(|&i| !table[i].in_use)
         .ok_or(DomainError::TableFull)?;
     // SAFETY: pos-init_paging por contrato.
-    let cr3 = unsafe {
-        mm::clone_kernel_higher_half().map_err(|_| DomainError::OutOfMemory)?
-    };
+    let cr3 = unsafe { mm::clone_kernel_higher_half().map_err(|_| DomainError::OutOfMemory)? };
     table[slot] = DomainSlot::empty();
     table[slot].in_use = true;
     table[slot].cr3 = cr3;
@@ -276,10 +277,7 @@ pub unsafe fn map(
     let cr3 = table[idx].cr3;
     // SAFETY: cr3 valido (clone_kernel_higher_half), va lower-half, phys
     // e perm validados acima.
-    unsafe {
-        mm::map_user_page(cr3, va, phys, perm)
-            .map_err(|_| DomainError::MappingFailed)
-    }
+    unsafe { mm::map_user_page(cr3, va, phys, perm).map_err(|_| DomainError::MappingFailed) }
 }
 
 /// Carrega CR3 do dominio, marca-o como `CURRENT_DOMAIN`, e salta para
@@ -352,7 +350,9 @@ pub fn cap_grant(
     if !src_rights.contains(rights) {
         return Err(DomainError::InsufficientRights);
     }
-    table[dst_idx].cspace.insert_root(dst_slot, object, rights)?;
+    table[dst_idx]
+        .cspace
+        .insert_root(dst_slot, object, rights)?;
     // (Phase 8) Registra grant em tabela paralela para revogacao
     // visivel cross-CSpace.
     register_grant(src_dh, src_slot, dst_dh, dst_slot)?;
@@ -397,9 +397,8 @@ struct GrantTable(UnsafeCell<[GrantEntry; MAX_GRANTS]>);
 // SAFETY: idem `DomainTable` — single-core.
 unsafe impl Sync for GrantTable {}
 
-static GRANTS: GrantTable = GrantTable(UnsafeCell::new(
-    [const { GrantEntry::empty() }; MAX_GRANTS],
-));
+static GRANTS: GrantTable =
+    GrantTable(UnsafeCell::new([const { GrantEntry::empty() }; MAX_GRANTS]));
 
 fn register_grant(
     src_dh: DomainHandle,
@@ -431,10 +430,7 @@ fn register_grant(
 /// mecanismo e 'cap sumiu do CSpace'.
 ///
 /// Retorna numero de destinos revogados (>= 1) ou `NoGrant`.
-pub fn revoke_granted(
-    src_dh: DomainHandle,
-    src_slot: CapSlot,
-) -> Result<usize, DomainError> {
+pub fn revoke_granted(src_dh: DomainHandle, src_slot: CapSlot) -> Result<usize, DomainError> {
     // SAFETY: idem.
     let grants = unsafe { &mut *GRANTS.0.get() };
     let table = unsafe { &mut *DOMAINS.0.get() };
@@ -528,8 +524,7 @@ pub fn poll_notify(slot: CapSlot) -> Result<u64, DomainError> {
     if !rights.contains(CapRights::READ) {
         return Err(DomainError::InsufficientRights);
     }
-    notification::poll(NotifyHandle::from_raw(handle))
-        .map_err(|_| DomainError::BadHandle)
+    notification::poll(NotifyHandle::from_raw(handle)).map_err(|_| DomainError::BadHandle)
 }
 
 /// Arma timer one-shot. Requer `CapObject::Timer` (direito WRITE) em
@@ -604,10 +599,7 @@ fn caller_has_domain_cap(caller_idx: usize, target: DomainHandle) -> bool {
 ///
 /// `ctx` deve apontar para `UserContext` valido na syscall stack
 /// (construido por `syscall_entry`).
-pub unsafe fn pct_call(
-    ctx: *mut UserContext,
-    target_raw: u8,
-) -> Result<(), DomainError> {
+pub unsafe fn pct_call(ctx: *mut UserContext, target_raw: u8) -> Result<(), DomainError> {
     let cur_h = current().ok_or(DomainError::NoCurrentDomain)?;
     let target_h = DomainHandle(target_raw);
     if cur_h == target_h {
@@ -664,10 +656,7 @@ pub unsafe fn pct_call(
 /// # Safety
 ///
 /// Idem `pct_call`.
-pub unsafe fn pct_reply(
-    ctx: *mut UserContext,
-    value: u64,
-) -> Result<(), DomainError> {
+pub unsafe fn pct_reply(ctx: *mut UserContext, value: u64) -> Result<(), DomainError> {
     let cur_h = current().ok_or(DomainError::NoCurrentDomain)?;
     let cur_idx = cur_h.0 as usize;
     // SAFETY: idem.
@@ -685,4 +674,3 @@ pub unsafe fn pct_reply(
     log::write_str("[kernel] pct_reply ok\n");
     Ok(())
 }
-
