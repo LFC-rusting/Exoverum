@@ -1,7 +1,10 @@
+//! Bootloader UEFI: shim de entry. Stability: **STABLE** (UEFI ABI fixa por
+//! spec). Audit log: `docs/UNSAFE.md`.
+
 #![no_std]
 #![no_main]
 
-use bootloader::platform::uefi::{efi_entry, EfiHandle, EfiSystemTable};
+use bootloader::platform::uefi::{EfiHandle, EfiSystemTable, efi_entry};
 
 /// Entry point UEFI exportado no binário final. Chamado pela firmware
 /// UEFI; argumentos vêm direto dela e o ponteiro `system_table` é
