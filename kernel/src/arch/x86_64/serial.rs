@@ -3,6 +3,11 @@
 //! Write-only, sem input, sem parsing. Equivalente funcional a serial do
 //! bootloader; mantida separada porque cada binario (UEFI e ELF bare-metal)
 //! inicializa o hardware em seu contexto.
+//!
+//! Toda interacao com hardware passa pelos wrappers safe `super::cpu::outb`
+//! e `super::cpu::inb`; este modulo nao usa `unsafe` diretamente (regra 13).
+
+#![forbid(unsafe_code)]
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
