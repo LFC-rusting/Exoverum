@@ -1,5 +1,8 @@
 //! Local APIC (xAPIC mode): primitivas de baixo nivel.
 //!
+//! Stability: **STABLE** (Intel SDM Vol. 3 §10 — xAPIC offsets fixos).
+//! Audit log: `docs/UNSAFE.md`.
+//!
 //! # Escopo
 //!
 //! Mecanismo puro de timer one-shot + EOI. Politica (quando disparar,
