@@ -2,6 +2,7 @@
 /target/
 
 # Diretórios internos
+.windsurf/
 /docs/
 
 # Arquivos temporários de editor/SO
