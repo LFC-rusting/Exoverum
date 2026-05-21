@@ -63,25 +63,25 @@ works today; UDFs, wakeup predicates and software regions are
 
 The exokernel is **architecturally complete**. All eight phases of
 the roadmap are merged. Hard code budget: total Rust source stays
-at **≤ 4.5k Lines of Code**. Current footprint is:
+at **≤ 3.5k Lines of Code**. Current footprint is:
 
 | Artifact | LoC |
 |---|---|
-| Bootloader | 1232 LoC |
-| Kernel | 3192 LoC |
+| Bootloader | 1281 LoC |
+| Kernel | 3284 LoC |
 | Crates (bootinfo) | 58 LoC |
-| **Total** | **4482 LoC** |
+| **Total** | **4623 LoC** - **1370 LoC (Non-essential)** = **3253 LoC** |
 
 Of this footprint, the following lines exist only as scaffolding —
 removing them yields a kernel that still boots to halt:
 
 | Non-essential | LoC |
 |---|---|
-| Host tests (cap=567, frame=304, paging=193, sha256=165, bootinfo=58, elf=183, notification=100, timer=119) | 1689 |
-| Demo userland (`kernel/src/arch/x86_64/userland.rs`) | 235 |
-| Demo functions in `kmain.rs` (demo_userland, setup_domain, fail, demo_caps, demo_physmap, log_frame_stats, demo_alloc_free) | 179 |
+| Host tests (cap=331, frame=124, paging=103, sha256=60, bootinfo=25, elf=23, notification=56, timer=50) | 772 |
+| Demo userland (`kernel/src/arch/x86_64/userland.rs`) | 246 |
+| Demo functions in `kmain.rs` (demo_userland, setup_domain, fail, demo_caps, demo_physmap, log_frame_stats, demo_alloc_free) | 185 |
 | Bare-metal visual feedback (`kernel/src/fb.rs`) | 167 |
-| **Total non-essential** | **2270** |
+| **Total non-essential** | **1370 (29,63% of total)** |
 
 Host test suite:
 **77 tests, all passing** (63 kernel + 10 bootloader + 4 bootinfo).
@@ -383,7 +383,7 @@ rustup target add x86_64-unknown-none
 make            # build bootloader + kernel + compose the FAT32 .img
 make run        # boot in QEMU (serial -> stdout)
 make run-debug  # QEMU stopped on -S -s with -d int,cpu_reset (gdb on :1234)
-make test       # 65 host unit tests (cap, paging, frame, ELF, SHA-256, ...)
+make test       # 77 host unit tests (cap, paging, frame, ELF, SHA-256, ...)
 make clean
 ```
 
@@ -404,7 +404,7 @@ cargo build --release -p kernel --target x86_64-unknown-none
 cargo build-bootloader-release
 cargo build-kernel-release
 
-# 2. Run the host tests (65 tests, no QEMU needed):
+# 2. Run the host tests (77 tests, no QEMU needed):
 cargo test-host
 ```
 
@@ -474,11 +474,11 @@ After a clean release build the on-disk footprint is:
 
 | Artifact | Path | Size |
 |---|---|---|
-| Bootloader | `target/x86_64-unknown-uefi/release/bootloader.efi` | ~5.5 KiB |
-| Kernel ELF | `target/x86_64-unknown-none/release/kernel` | ~76 KiB |
+| Bootloader | `target/x86_64-unknown-uefi/release/bootloader.efi` | ~2.5 KiB |
+| Kernel ELF | `target/x86_64-unknown-none/release/kernel` | ~69 KiB |
 | Disk image | `target/exoverum.img` (FAT32) | 33 MiB |
 
-The two binaries together are about **82 KiB**; the disk image is
+The two binaries together are about **72 KiB**; the disk image is
 33 MiB only because UEFI requires a FAT32 ESP and `mkfs.fat` refuses
 to format anything smaller. Override with `make IMG_MB=N` if you
 need a bigger ESP for future LibOSes; the binaries don't grow.
