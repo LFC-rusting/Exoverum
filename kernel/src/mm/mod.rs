@@ -1,5 +1,8 @@
 //! Subsistema de gerenciamento de memoria.
 //!
+//! Stability: **STABLE** (fronteira `unsafe` minima; `static mut` global
+//! ate suporte SMP). Audit log: `docs/UNSAFE.md`.
+//!
 //! # Estrutura
 //!
 //! - `frame`: logica pura (bitmap allocator). `#![forbid(unsafe_code)]`.
@@ -214,9 +217,27 @@ pub unsafe fn init_paging() -> Result<u64, PagingError> {
 
     // 2. Mapeia cada secao do kernel com seu perfil W^X. `virt` = simbolo
     //    do linker (higher-half); `phys` = virt - KERNEL_VMA_OFFSET.
-    map_range(pml4_phys, text_start, text_end, text_start - KERNEL_VMA_OFFSET, Perm::Rx)?;
-    map_range(pml4_phys, rodata_start, rodata_end, rodata_start - KERNEL_VMA_OFFSET, Perm::Ro)?;
-    map_range(pml4_phys, data_start, bss_end, data_start - KERNEL_VMA_OFFSET, Perm::Rw)?;
+    map_range(
+        pml4_phys,
+        text_start,
+        text_end,
+        text_start - KERNEL_VMA_OFFSET,
+        Perm::Rx,
+    )?;
+    map_range(
+        pml4_phys,
+        rodata_start,
+        rodata_end,
+        rodata_start - KERNEL_VMA_OFFSET,
+        Perm::Ro,
+    )?;
+    map_range(
+        pml4_phys,
+        data_start,
+        bss_end,
+        data_start - KERNEL_VMA_OFFSET,
+        Perm::Rw,
+    )?;
 
     // SAFETY: pml4_phys foi construido acima. Todas as paginas que o
     // kernel continuara a executar ate `halt_forever` (text, stack em
@@ -226,7 +247,9 @@ pub unsafe fn init_paging() -> Result<u64, PagingError> {
     // Intencional: NAO mapeamos heap kernel. Exokernel puro (Engler95
     // §3.1) nao prove abstracoes de memoria dinamica no kernel; LibOS
     // recebe frames via capability e constroi seus proprios alocadores.
-    unsafe { cpu::load_cr3(pml4_phys); }
+    unsafe {
+        cpu::load_cr3(pml4_phys);
+    }
 
     // Ativa physmap: dai em diante, `phys_to_virt(p) = p + PHYSMAP_BASE`.
     // Identity UEFI some mas permanecemos capazes de ler/escrever qualquer
@@ -241,7 +264,7 @@ pub unsafe fn init_paging() -> Result<u64, PagingError> {
 /// PS=1 apontando para o respectivo 1 GiB de RAM fisica.
 #[cfg(target_os = "none")]
 fn map_physmap(pml4_phys: u64) -> Result<(), PagingError> {
-    use paging::{make_huge_pte, Indices};
+    use paging::{Indices, make_huge_pte};
     const GIB: u64 = 1 << 30;
 
     for i in 0..PHYSMAP_GIB {
@@ -293,9 +316,18 @@ fn map_range(
     // assert! (nao debug_assert!): violacao escreveria PTE com bits de
     // offset corrompendo flags W/NX, abrindo escalada de privilegio
     // silenciosa. Custo em release: 3 comparacoes no boot, desprezivel.
-    assert!(vstart & (frame::FRAME_SIZE - 1) == 0, "map_range: vstart misaligned");
-    assert!(vend & (frame::FRAME_SIZE - 1) == 0, "map_range: vend misaligned");
-    assert!(phys_start & (frame::FRAME_SIZE - 1) == 0, "map_range: phys_start misaligned");
+    assert!(
+        vstart & (frame::FRAME_SIZE - 1) == 0,
+        "map_range: vstart misaligned"
+    );
+    assert!(
+        vend & (frame::FRAME_SIZE - 1) == 0,
+        "map_range: vend misaligned"
+    );
+    assert!(
+        phys_start & (frame::FRAME_SIZE - 1) == 0,
+        "map_range: phys_start misaligned"
+    );
     let mut v = vstart;
     let mut p = phys_start;
     while v < vend {
@@ -310,7 +342,7 @@ fn map_range(
 /// intermediarias conforme necessario.
 #[cfg(target_os = "none")]
 fn map_4k(pml4_phys: u64, virt: u64, phys: u64, perm: Perm) -> Result<(), PagingError> {
-    use paging::{make_pte, pte_present, Indices};
+    use paging::{Indices, make_pte, pte_present};
 
     let idx = Indices::from_virt(virt);
     // Caminha PML4 -> PDPT -> PD -> PT, criando niveis vazios se preciso.
@@ -390,15 +422,25 @@ fn ensure_next_level(parent_phys: u64, idx: usize) -> Result<u64, PagingError> {
 pub unsafe fn map_kernel_page(virt: u64, phys: u64, perm: Perm) -> Result<(), PagingError> {
     use crate::arch::x86_64::cpu;
     // assert!: ver justificativa em `map_range`. Mesma classe de bug.
-    assert_eq!(virt & (frame::FRAME_SIZE - 1), 0, "map_kernel_page: virt misaligned");
-    assert_eq!(phys & (frame::FRAME_SIZE - 1), 0, "map_kernel_page: phys misaligned");
+    assert_eq!(
+        virt & (frame::FRAME_SIZE - 1),
+        0,
+        "map_kernel_page: virt misaligned"
+    );
+    assert_eq!(
+        phys & (frame::FRAME_SIZE - 1),
+        0,
+        "map_kernel_page: phys misaligned"
+    );
     assert!(!perm.is_user(), "map_kernel_page: user Perm forbidden here");
     let pml4_phys = cpu::read_cr3() & paging::PTE_ADDR_MASK;
     map_4k(pml4_phys, virt, phys, perm)?;
     // TLB invalidate da pagina recem-mapeada: escritas anteriores em PTEs
     // nao sao automaticamente refletidas; INVLPG garante que a proxima
     // traducao veja o novo mapeamento.
-    unsafe { cpu::invlpg(virt); }
+    unsafe {
+        cpu::invlpg(virt);
+    }
     Ok(())
 }
 
@@ -421,8 +463,16 @@ pub unsafe fn map_user_page(
     perm: Perm,
 ) -> Result<(), PagingError> {
     assert!(perm.is_user(), "map_user_page: kernel Perm forbidden here");
-    assert_eq!(virt & (frame::FRAME_SIZE - 1), 0, "map_user_page: virt misaligned");
-    assert_eq!(phys & (frame::FRAME_SIZE - 1), 0, "map_user_page: phys misaligned");
+    assert_eq!(
+        virt & (frame::FRAME_SIZE - 1),
+        0,
+        "map_user_page: virt misaligned"
+    );
+    assert_eq!(
+        phys & (frame::FRAME_SIZE - 1),
+        0,
+        "map_user_page: phys misaligned"
+    );
     // Lower-half: bits [63:47] devem ser zero (canonico user).
     assert!(
         virt < 0x0000_8000_0000_0000,
