@@ -56,8 +56,14 @@ pub fn kernel_phys_range_from_elf(elf: &[u8]) -> Result<PhysRange, BootError> {
         }
         let start = ph.paddr;
         let end = start.checked_add(ph.memsz).ok_or(BootError::InvalidElf)?;
-        min = Some(match min { Some(v) => v.min(start), None => start });
-        max = Some(match max { Some(v) => v.max(end), None => end });
+        min = Some(match min {
+            Some(v) => v.min(start),
+            None => start,
+        });
+        max = Some(match max {
+            Some(v) => v.max(end),
+            None => end,
+        });
     }
     match (min, max) {
         (Some(start), Some(end)) => Ok(PhysRange { start, end }),
@@ -113,7 +119,9 @@ pub fn validate_kernel_elf(elf: &[u8]) -> Result<(), BootError> {
             }
         }
         let start_i = ph_i.vaddr;
-        let end_i = start_i.checked_add(ph_i.memsz).ok_or(BootError::InvalidElfOverlap)?;
+        let end_i = start_i
+            .checked_add(ph_i.memsz)
+            .ok_or(BootError::InvalidElfOverlap)?;
         for j in 0..hdr.phnum {
             if i == j {
                 continue;
@@ -123,7 +131,9 @@ pub fn validate_kernel_elf(elf: &[u8]) -> Result<(), BootError> {
                 continue;
             }
             let start_j = ph_j.vaddr;
-            let end_j = start_j.checked_add(ph_j.memsz).ok_or(BootError::InvalidElfOverlap)?;
+            let end_j = start_j
+                .checked_add(ph_j.memsz)
+                .ok_or(BootError::InvalidElfOverlap)?;
             if ranges_overlap(start_i, end_i, start_j, end_j) {
                 return Err(BootError::InvalidElfOverlap);
             }
@@ -155,7 +165,12 @@ pub fn parse_elf_header(elf: &[u8]) -> Result<ElfHeader, BootError> {
     })
 }
 
-pub fn parse_ph(elf: &[u8], phoff: u64, entsize: u16, idx: u16) -> Result<ProgramHeader, BootError> {
+pub fn parse_ph(
+    elf: &[u8],
+    phoff: u64,
+    entsize: u16,
+    idx: u16,
+) -> Result<ProgramHeader, BootError> {
     let start = phoff
         .checked_add((entsize as u64) * (idx as u64))
         .ok_or(BootError::InvalidElf)? as usize;
@@ -185,7 +200,9 @@ fn entry_in_executable_segment(elf: &[u8], hdr: &ElfHeader) -> Result<bool, Boot
             continue;
         }
         let start = ph.vaddr;
-        let end = start.checked_add(ph.memsz).ok_or(BootError::InvalidElfEntry)?;
+        let end = start
+            .checked_add(ph.memsz)
+            .ok_or(BootError::InvalidElfEntry)?;
         if hdr.entry >= start && hdr.entry < end {
             let exec = (ph.flags & PF_X) != 0;
             let writable = (ph.flags & PF_W) != 0;
