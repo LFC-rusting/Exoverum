@@ -109,6 +109,8 @@ unsafe extern "C" {
     static __rodata_start: u8;
     static __rodata_end: u8;
     static __data_start: u8;
+    static __bss_nostack_end: u8;
+    static __kernel_stack_bottom: u8;
     static __bss_end: u8;
 }
 
@@ -134,6 +136,15 @@ pub const PHYSMAP_GIB: u64 = 1;
 /// Tamanho total do physmap em bytes. Limite superior estrito para enderecos
 /// fisicos passados a `phys_to_virt`.
 pub const PHYSMAP_BYTES: u64 = PHYSMAP_GIB * (1 << 30);
+
+// H-2: todo frame que o alocador pode entregar precisa ser enderecavel pelo
+// physmap. Se `MAX_MANAGED_FRAMES` subir acima da janela do physmap sem
+// aumentar `PHYSMAP_GIB`, `phys_to_virt` entraria em panic no boot ao
+// receber um frame alto. Esta asercao quebra o BUILD, nao o boot.
+const _: () = assert!(
+    (frame::MAX_MANAGED_FRAMES as u64) * frame::FRAME_SIZE <= PHYSMAP_BYTES,
+    "managed frames must fit within the physmap window (raise PHYSMAP_GIB)"
+);
 
 /// Offset dinamico para `phys_to_virt`. Comeca em 0 (identity UEFI ativo),
 /// vira `PHYSMAP_BASE` depois que `init_paging` carrega o novo CR3.
@@ -206,6 +217,8 @@ pub unsafe fn init_paging() -> Result<u64, PagingError> {
     let rodata_start = addr_of!(__rodata_start) as u64;
     let rodata_end = addr_of!(__rodata_end) as u64;
     let data_start = addr_of!(__data_start) as u64;
+    let bss_nostack_end = addr_of!(__bss_nostack_end) as u64;
+    let stack_bottom = addr_of!(__kernel_stack_bottom) as u64;
     let bss_end = addr_of!(__bss_end) as u64;
 
     let pml4_phys = alloc_zeroed_table().ok_or(PagingError::OutOfFrames)?;
@@ -231,11 +244,23 @@ pub unsafe fn init_paging() -> Result<u64, PagingError> {
         rodata_start - KERNEL_VMA_OFFSET,
         Perm::Ro,
     )?;
+    // .data + .bss "normal" (tudo abaixo da guard page da stack).
     map_range(
         pml4_phys,
         data_start,
-        bss_end,
+        bss_nostack_end,
         data_start - KERNEL_VMA_OFFSET,
+        Perm::Rw,
+    )?;
+    // H-1: a guard page [bss_nostack_end, stack_bottom) e deliberadamente
+    // NAO mapeada. Um overflow da stack do kernel (que cresce para baixo a
+    // partir de __kernel_stack_top) faulta (#PF -> IST2) aqui em vez de
+    // corromper .bss silenciosamente.
+    map_range(
+        pml4_phys,
+        stack_bottom,
+        bss_end,
+        stack_bottom - KERNEL_VMA_OFFSET,
         Perm::Rw,
     )?;
 
