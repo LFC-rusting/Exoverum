@@ -109,13 +109,6 @@ pub fn write_byte(b: u8) {
     unsafe { outb(COM1 + UART_THR, b) };
 }
 
-/// Escrevo uma sequência de bytes na COM1.
-pub fn write_bytes(bytes: &[u8]) {
-    for &b in bytes {
-        write_byte(b);
-    }
-}
-
 /// Escrevo uma string ASCII na COM1 traduzindo `\n` para `\r\n`.
 /// Não interpreto nem filtro outro conteúdo.
 pub fn write_str(s: &str) {
