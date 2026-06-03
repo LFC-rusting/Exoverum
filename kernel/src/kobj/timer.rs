@@ -43,29 +43,20 @@ static ARMED: AtomicBool = AtomicBool::new(false);
 static NOTIFY_HANDLE: AtomicU8 = AtomicU8::new(0);
 static NOTIFY_BITS: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum TimerError {
-    /// Ticks invalidos (0 = disarm, tratar como Ok).
-    BadTicks,
-    /// NotifyHandle fora de range.
-    BadNotify,
-}
-
 /// Arma timer one-shot. Quando o IRQ chegar, kernel sinaliza
 /// `(notify, bits)`. `ticks=0` cancela arming existente.
 ///
-/// Retorna ok mesmo se outro arm anterior estava pendente; o novo
-/// sobrescreve (single LAPIC timer, single callback).
-pub fn arm(notify: NotifyHandle, bits: u64, ticks: u32) -> Result<(), TimerError> {
+/// Infalivel: ha um unico LAPIC timer e um unico callback global, entao
+/// um novo arm simplesmente sobrescreve qualquer pendente.
+pub fn arm(notify: NotifyHandle, bits: u64, ticks: u32) {
     if ticks == 0 {
         disarm();
-        return Ok(());
+        return;
     }
     NOTIFY_HANDLE.store(notify.raw(), Ordering::Relaxed);
     NOTIFY_BITS.store(bits, Ordering::Relaxed);
     ARMED.store(true, Ordering::Release);
     arm_hw(ticks);
-    Ok(())
 }
 
 /// Cancela arming. Idempotente.
@@ -121,7 +112,7 @@ mod tests {
     #[test]
     fn arm_with_zero_ticks_disarms() {
         let n = notification::create().unwrap();
-        arm(n, 0b1, 0).unwrap();
+        arm(n, 0b1, 0);
         assert!(!ARMED.load(Ordering::Acquire));
         notification::destroy(n).unwrap();
     }
@@ -129,7 +120,7 @@ mod tests {
     #[test]
     fn fire_signals_armed_notification() {
         let n = notification::create().unwrap();
-        arm(n, 0b1000, 100).unwrap();
+        arm(n, 0b1000, 100);
         fire();
         let v = notification::poll(n).unwrap();
         assert_eq!(v, 0b1000);
@@ -148,7 +139,7 @@ mod tests {
     #[test]
     fn double_fire_signals_once() {
         let n = notification::create().unwrap();
-        arm(n, 0b10, 100).unwrap();
+        arm(n, 0b10, 100);
         fire();
         fire(); // segundo fire nao acha armado, no-op
         let v = notification::poll(n).unwrap();
@@ -160,8 +151,8 @@ mod tests {
     fn rearm_overwrites_callback() {
         let n1 = notification::create().unwrap();
         let n2 = notification::create().unwrap();
-        arm(n1, 0b1, 100).unwrap();
-        arm(n2, 0b10, 100).unwrap();
+        arm(n1, 0b1, 100);
+        arm(n2, 0b10, 100);
         fire();
         assert_eq!(notification::poll(n1).unwrap(), 0, "n1 nao sinalizado");
         assert_eq!(notification::poll(n2).unwrap(), 0b10, "n2 sinalizado");
