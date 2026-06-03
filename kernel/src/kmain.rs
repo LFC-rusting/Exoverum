@@ -263,7 +263,11 @@ fn setup_domain(
         }
     }
 
-    let read = CapRights::READ;
+    // Slot 0 (frame de payload) carrega GRANT alem de READ: em
+    // `demo_userland`, o dominio A delega esta cap a B via `cap_grant`, que
+    // agora exige o direito GRANT na origem (AUDIT L-1). READ sozinho basta
+    // para o mapeamento UserRx feito logo abaixo.
+    let read = CapRights(CapRights::READ.0 | CapRights::GRANT.0);
     let rw = CapRights(CapRights::READ.0 | CapRights::WRITE.0);
     if domain::insert_root(dh, 0, CapObject::Frame { phys: pf.addr() }, read).is_err()
         || domain::insert_root(dh, 1, CapObject::Frame { phys: sf.addr() }, rw).is_err()
