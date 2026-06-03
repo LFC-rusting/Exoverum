@@ -266,27 +266,45 @@ impl CapTable {
         }
     }
 
-    /// Revoga recursivamente TODOS os descendentes de `slot`. O proprio slot
-    /// permanece. E o primitivo de seguranca: apos `revoke(slot)`, nenhuma
-    /// capability derivada de `slot` continua valida.
+    /// Revoga TODOS os descendentes de `slot`. O proprio slot permanece.
+    /// E o primitivo de seguranca: apos `revoke(slot)`, nenhuma capability
+    /// derivada de `slot` continua valida.
+    ///
+    /// Teardown **iterativo** (uso de stack do kernel O(1)): cada iteracao
+    /// desce ao no mais profundo da subarvore de `slot` e remove uma folha.
+    /// Como ha no maximo `CAP_SLOTS` nos vivos e cada iteracao apaga
+    /// exatamente um, o laco externo executa <= `CAP_SLOTS` vezes. Substitui
+    /// a recursao anterior, cuja profundidade igualava a cadeia de derivacao
+    /// (ate `CAP_SLOTS`) numa stack de kernel sem guard page (AUDIT L-3).
     pub fn revoke(&mut self, slot: CapSlot) -> Result<(), CapError> {
         self.check_range(slot)?;
         if matches!(self.entries[slot as usize], CapEntry::Empty) {
             return Err(CapError::SlotEmpty);
         }
-        // Itera filhos ate nao restar nenhum. Cada chamada recursiva revoga
-        // os netos e depois o delete_leaf apaga o filho, atualizando
-        // first_child de `slot`. Profundidade maxima = CAP_SLOTS = 256.
-        loop {
+        // Cada iteracao remove uma folha; no maximo CAP_SLOTS nos existem,
+        // logo CAP_SLOTS iteracoes bastam (o limite tambem protege contra
+        // um ciclo na CDT, que nao deveria existir).
+        for _ in 0..CAP_SLOTS {
             let child = match self.entries[slot as usize] {
                 CapEntry::Cap { first_child, .. } => first_child,
                 CapEntry::Empty => return Ok(()),
             };
             if child == NULL_SLOT {
-                break;
+                return Ok(());
             }
-            self.revoke(child)?;
-            self.unlink_and_clear(child)?;
+            // Desce ate uma folha (no sem filhos) dentro da subarvore. O
+            // limite de iteracoes (CAP_SLOTS) garante terminacao mesmo se a
+            // estrutura estiver corrompida.
+            let mut node = child;
+            for _ in 0..CAP_SLOTS {
+                match self.entries[node as usize] {
+                    CapEntry::Cap { first_child, .. } if first_child != NULL_SLOT => {
+                        node = first_child;
+                    }
+                    _ => break,
+                }
+            }
+            self.unlink_and_clear(node)?;
         }
         Ok(())
     }
@@ -614,6 +632,25 @@ mod tests {
         }
         t.revoke(0).unwrap();
         for i in 1..64u16 {
+            assert_eq!(t.lookup(i), Err(CapError::SlotEmpty));
+        }
+    }
+
+    #[test]
+    fn revoke_full_depth_chain_no_overflow() {
+        // Cadeia linear no comprimento maximo da CSpace (0 -> 1 -> ... ->
+        // CAP_SLOTS-1). Exercita o teardown iterativo (AUDIT L-3) na maior
+        // profundidade possivel: confirma terminacao e remocao total sem
+        // recursao.
+        let mut t = CapTable::new();
+        t.insert_root(0, mk_untyped(0, 0x10_0000), CapRights::ALL)
+            .unwrap();
+        for i in 1..CAP_SLOTS as u16 {
+            t.copy(i - 1, i, CapRights::ALL).unwrap();
+        }
+        t.revoke(0).unwrap();
+        assert!(t.lookup(0).is_ok(), "root must survive");
+        for i in 1..CAP_SLOTS as u16 {
             assert_eq!(t.lookup(i), Err(CapError::SlotEmpty));
         }
     }
