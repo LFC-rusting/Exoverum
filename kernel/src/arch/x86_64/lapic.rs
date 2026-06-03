@@ -29,7 +29,7 @@
 //! `#[forbid(unsafe_code)]` nao pode ser aplicado (escrita MMIO exige
 //! ponteiro bruto). `unsafe` minimo, isolado, cada bloco com `SAFETY:`.
 
-use core::ptr::{read_volatile, write_volatile};
+use core::ptr::write_volatile;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::arch::x86_64::cpu::{rdmsr, wrmsr};
@@ -37,10 +37,12 @@ use crate::arch::x86_64::cpu::{rdmsr, wrmsr};
 /// MSR IA32_APIC_BASE. Bit 11 = xAPIC global enable. Bits [51:12] = base fisica.
 const MSR_APIC_BASE: u32 = 0x1B;
 const APIC_BASE_ENABLE: u64 = 1 << 11;
+/// Bit 10 = x2APIC enable. Em modo x2APIC a interface MMIO (usada aqui)
+/// fica desabilitada; acessa-la geraria #GP.
+const APIC_BASE_X2APIC: u64 = 1 << 10;
 const APIC_BASE_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
 // Offsets xAPIC (em bytes a partir da base MMIO, 16-byte aligned).
-const REG_ID: usize = 0x020;
 const REG_TPR: usize = 0x080;
 const REG_EOI: usize = 0x0B0;
 const REG_SVR: usize = 0x0F0;
@@ -76,25 +78,15 @@ pub const TIMER_VECTOR: u8 = 0x40;
 /// mas MMIO aliases de cada core pra sua propria instancia — Intel SDM).
 static LAPIC_BASE: AtomicPtr<u32> = AtomicPtr::new(core::ptr::null_mut());
 
-/// Le registro 32-bit do LAPIC via MMIO. Retorna 0 se nao inicializado.
-fn read_reg(off: usize) -> u32 {
-    let base = LAPIC_BASE.load(Ordering::Relaxed);
-    if base.is_null() {
-        return 0;
-    }
-    // SAFETY: `base` foi mapeado como Mmio (UC+NX+RW) em `init`; off esta
-    // no intervalo valido de registros xAPIC (< 4 KiB); leitura volatile
-    // de 32 bits alinhada (offsets sao multiplos de 16).
-    unsafe { read_volatile(base.cast::<u8>().add(off).cast::<u32>()) }
-}
-
 /// Escreve registro 32-bit do LAPIC via MMIO. No-op se nao inicializado.
 fn write_reg(off: usize, val: u32) {
     let base = LAPIC_BASE.load(Ordering::Relaxed);
     if base.is_null() {
         return;
     }
-    // SAFETY: idem `read_reg`; escrita volatile.
+    // SAFETY: `base` foi mapeado como Mmio (UC+NX+RW) em `init`; `off` esta
+    // no intervalo valido de registros xAPIC (< 4 KiB) e e multiplo de 16;
+    // escrita volatile de 32 bits alinhada.
     unsafe {
         write_volatile(base.cast::<u8>().add(off).cast::<u32>(), val);
     }
@@ -102,10 +94,11 @@ fn write_reg(off: usize, val: u32) {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum LapicError {
-    /// MSR reporta LAPIC desabilitado (bit 11 do IA32_APIC_BASE).
-    Disabled,
     /// `mm::map_kernel_page` falhou mapeando a pagina MMIO.
     MapFailed,
+    /// CPU/firmware em modo x2APIC (bit 10): a interface MMIO deste modulo
+    /// nao se aplica. O caller deve continuar sem timer (H-4).
+    X2ApicMode,
 }
 
 /// Inicializa o LAPIC: mapeia MMIO, habilita via SVR, mascara o timer.
@@ -118,6 +111,12 @@ pub enum LapicError {
 pub unsafe fn init() -> Result<(), LapicError> {
     // Le MSR e verifica enable global.
     let base_msr = rdmsr(MSR_APIC_BASE);
+    // H-4: em modo x2APIC os registros nao sao acessiveis via MMIO; tocar a
+    // pagina MMIO geraria #GP. Detectamos e abortamos com erro (o timer e
+    // opcional; kmain loga e segue sem ele) em vez de faultar.
+    if base_msr & APIC_BASE_X2APIC != 0 {
+        return Err(LapicError::X2ApicMode);
+    }
     if base_msr & APIC_BASE_ENABLE == 0 {
         // Enable global (bit 11) caso firmware tenha deixado off.
         wrmsr(MSR_APIC_BASE, base_msr | APIC_BASE_ENABLE);
@@ -170,10 +169,4 @@ pub fn disarm() {
 /// de qualquer IRQ entregue pelo LAPIC (timer, IPI, etc).
 pub fn eoi() {
     write_reg(REG_EOI, 0);
-}
-
-/// Retorna o APIC ID do core atual (para diagnostico).
-#[allow(dead_code)]
-pub fn local_id() -> u32 {
-    read_reg(REG_ID) >> 24
 }
