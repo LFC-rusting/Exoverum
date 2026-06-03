@@ -52,15 +52,6 @@ pub struct KernelImage<'a> {
     pub expected_sha256: [u8; 32],
 }
 
-/// Informações coletadas da plataforma antes do ExitBootServices.
-pub struct PlatformInfo {
-    pub memory_map: MemoryMap,
-    pub framebuffer: Option<FramebufferInfo>,
-    pub rsdp: Option<u64>,
-    pub smbios: Option<u64>,
-    pub kernel_phys_range: PhysRange,
-}
-
 fn hex_nibble(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
@@ -86,10 +77,27 @@ fn parse_sha256_hex(hex: &str) -> Result<[u8; 32], BootError> {
     Ok(out)
 }
 
+// A-1: fail-closed em tempo de BUILD. Num build UEFI de RELEASE (o artefato
+// realmente deployavel; `make` usa `--release`), a ausencia do hash embutido
+// produziria um bootloader que rejeita QUALQUER kernel em runtime — falha
+// silenciosa e confusa. Forcamos erro de compilacao para que so o caminho
+// correto (`make`, que injeta a env via `sha256sum`) gere um .efi bootavel.
+//
+// Gated em `not(debug_assertions)`: `cargo check`/`clippy`/rust-analyzer
+// (perfil dev) e host-tests (linux-gnu) nao sao UEFI-release e nao definem a
+// env, entao continuam limpos. So o build deployavel e protegido.
+#[cfg(all(target_os = "uefi", not(test), not(debug_assertions)))]
+const _: () = assert!(
+    option_env!("EXOVERUM_KERNEL_SHA256").is_some(),
+    "EXOVERUM_KERNEL_SHA256 must be set for release UEFI builds (use `make`); \
+     a bootloader without the embedded kernel hash cannot boot any kernel"
+);
+
 /// Hash SHA-256 do `kernel.elf` embutido no build do bootloader.
 ///
 /// Preenchido em tempo de compilação via variável de ambiente
-/// `EXOVERUM_KERNEL_SHA256` (hex com 64 caracteres).
+/// `EXOVERUM_KERNEL_SHA256` (hex com 64 caracteres). Em alvo UEFI, a
+/// presença é garantida em tempo de build pelo `const _` acima (A-1).
 pub fn embedded_kernel_sha256() -> Result<[u8; 32], BootError> {
     let hex = option_env!("EXOVERUM_KERNEL_SHA256").ok_or(BootError::HashMismatch)?;
     parse_sha256_hex(hex)
