@@ -51,15 +51,6 @@ pub fn cli() {
     }
 }
 
-/// Habilita interrupcoes no core atual.
-#[inline]
-pub fn sti() {
-    // SAFETY: `sti` seta IF; seguro em ring0.
-    unsafe {
-        asm!("sti", options(nomem, nostack, preserves_flags));
-    }
-}
-
 /// Aguarda proxima interrupcao (usado em laco de halt).
 #[inline]
 pub fn hlt() {
