@@ -57,8 +57,18 @@ SECTIONS {
         *(COMMON)
         *(.bss .bss.*)
 
+        /* Fim do .bss "normal"; alinhado a pagina para permitir uma guard
+         * page logo abaixo da stack do kernel. */
+        . = ALIGN(0x1000);
+        __bss_nostack_end = .;
+
+        /* Guard page (4 KiB): mm::init_paging NAO a mapeia, de modo que um
+         * overflow da stack do kernel (que cresce para baixo a partir de
+         * __kernel_stack_top) faulte (#PF -> IST2) em vez de corromper .bss
+         * silenciosamente. NOBITS: nao ocupa bytes no arquivo. */
+        . += 0x1000;
+
         /* Stack inicial do kernel; usado pelo entry stub em main.rs. */
-        . = ALIGN(16);
         __kernel_stack_bottom = .;
         . += KERNEL_STACK_SIZE;
         __kernel_stack_top = .;
