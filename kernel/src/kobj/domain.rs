@@ -126,6 +126,11 @@ struct DomainSlot {
     /// `UserContext` salvo quando este dominio foi *suspenso* por
     /// chamar outro (`pct_call`). Restaurado por `pct_reply` no callee.
     saved_ctx: UserContext,
+    /// `true` enquanto este dominio esta suspenso como **caller** (emitiu
+    /// `pct_call` e aguarda o reply). Reentra-lo nesse estado destruiria
+    /// seu `saved_ctx`, entao `pct_call` para um dominio suspenso falha com
+    /// `Busy` (AUDIT L-4).
+    suspended: bool,
     /// Dominio marcado como abortado — faulted. Nunca mais recebe CPU;
     /// `pct_call` para este dominio falha com `Aborted`.
     aborted: bool,
@@ -141,6 +146,7 @@ impl DomainSlot {
             entry_rsp: 0,
             caller: None,
             saved_ctx: UserContext::fresh(0, 0),
+            suspended: false,
             aborted: false,
         }
     }
@@ -237,6 +243,17 @@ pub fn insert_root(
 }
 
 /// Mapeia uma pagina ring-3 no dominio com auditoria de capability.
+///
+/// # W^X (escopo atual)
+///
+/// A garantia W^X e validada **por PTE**: `UserRx` nunca e gravavel e
+/// `UserRw` nunca e executavel. NAO ha rastreamento por frame fisico — um
+/// mesmo frame com cap `READ|WRITE` poderia ser mapeado `UserRx` numa VA e
+/// `UserRw` noutra, produzindo um alias W^X dentro do proprio espaco do
+/// dominio. Hoje isso e inacessivel (esta API e so de boot confiavel, nao e
+/// syscall). Decisao explicita (AUDIT L-2 / INVARIANTS 4.2): a garantia
+/// declarada e **por-mapeamento**; W^X **por-frame** fica para quando `map`
+/// virar syscall mediada (ROADMAP Fase 11).
 ///
 /// # Safety
 ///
@@ -347,6 +364,13 @@ pub fn cap_grant(
         return Err(DomainError::BadHandle);
     }
     let (object, src_rights) = table[src_idx].cspace.lookup(src_slot)?;
+    // L-1: delegacao cross-CSpace exige o direito GRANT na cap de origem.
+    // Sem este gate, qualquer holder poderia repassar qualquer cap (escalada
+    // de autoridade / confused deputy). A atenuacao (`rights ⊆ src_rights`)
+    // continua valendo logo abaixo.
+    if !src_rights.contains(CapRights::GRANT) {
+        return Err(DomainError::InsufficientRights);
+    }
     if !src_rights.contains(rights) {
         return Err(DomainError::InsufficientRights);
     }
@@ -476,6 +500,8 @@ pub fn abort_current() {
     if idx < MAX_DOMAINS && table[idx].in_use {
         table[idx].aborted = true;
         table[idx].caller = None;
+        // L-4: um dominio abortado nao esta mais suspenso aguardando reply.
+        table[idx].suspended = false;
     }
     set_current(None);
     log::write_str("[kernel] domain abort (ring-3 fault)\n");
@@ -560,8 +586,7 @@ pub fn arm_timer(
     if !n_rights.contains(CapRights::WRITE) {
         return Err(DomainError::InsufficientRights);
     }
-    timer::arm(NotifyHandle::from_raw(n_handle), bits, ticks)
-        .map_err(|_| DomainError::BadHandle)?;
+    timer::arm(NotifyHandle::from_raw(n_handle), bits, ticks);
     Ok(())
 }
 
@@ -617,7 +642,10 @@ pub unsafe fn pct_call(ctx: *mut UserContext, target_raw: u8) -> Result<(), Doma
         if !table[tgt_idx].in_use {
             return Err(DomainError::BadHandle);
         }
-        if table[tgt_idx].caller.is_some() {
+        // Busy se o alvo ja atua como callee (`caller`) OU esta suspenso
+        // como caller (`suspended`): reentrar em qualquer dos casos
+        // corromperia o estado de PCT (AUDIT L-4).
+        if table[tgt_idx].caller.is_some() || table[tgt_idx].suspended {
             return Err(DomainError::Busy);
         }
         if table[tgt_idx].entry_rip == 0 || table[tgt_idx].entry_rsp == 0 {
@@ -634,6 +662,9 @@ pub unsafe fn pct_call(ctx: *mut UserContext, target_raw: u8) -> Result<(), Doma
     }
     // Salva ctx do caller. SAFETY: ctx valido por contrato.
     table[cur_idx].saved_ctx = unsafe { *ctx };
+    // L-4: marca o caller como suspenso ate o reply; impede reentrancia que
+    // sobrescreveria `saved_ctx`.
+    table[cur_idx].suspended = true;
     table[tgt_idx].caller = Some(cur_h);
     let entry = table[tgt_idx].entry_rip;
     let rsp = table[tgt_idx].entry_rsp;
@@ -663,6 +694,8 @@ pub unsafe fn pct_reply(ctx: *mut UserContext, value: u64) -> Result<(), DomainE
     let table = unsafe { &mut *DOMAINS.0.get() };
     let caller = table[cur_idx].caller.take().ok_or(DomainError::NoCaller)?;
     let caller_idx = caller.0 as usize;
+    // L-4: o caller volta a executar; deixa de estar suspenso.
+    table[caller_idx].suspended = false;
     let mut saved = table[caller_idx].saved_ctx;
     saved.rax = value;
     // SAFETY: ctx valido.
