@@ -107,43 +107,6 @@ impl UserContext {
 const _: () = assert!(core::mem::size_of::<UserContext>() == 20 * 8);
 
 // =================================================================
-// Payload smoke test (Phase 7a)
-// =================================================================
-
-global_asm!(
-    r#"
-    .section .rodata.userland_payload, "a"
-    .globl __userland_payload_start
-    .globl __userland_payload_end
-    .balign 16
-__userland_payload_start:
-    mov rax, 0
-    int 0x80
-    mov rax, 1
-    int 0x80
-    ud2
-__userland_payload_end:
-    "#
-);
-
-unsafe extern "C" {
-    static __userland_payload_start: u8;
-    static __userland_payload_end: u8;
-}
-
-/// Bytes do payload smoke test (`.rodata.userland_payload`).
-pub fn payload_bytes() -> &'static [u8] {
-    let start = core::ptr::addr_of!(__userland_payload_start);
-    let end = core::ptr::addr_of!(__userland_payload_end);
-    // SAFETY: simbolos de linker em higher-half kernel; intervalo
-    // bem-formado, bytes constantes.
-    unsafe {
-        let len = (end as usize) - (start as usize);
-        core::slice::from_raw_parts(start, len)
-    }
-}
-
-// =================================================================
 // Payload Phase 7b: dois clientes de PCT.
 // =================================================================
 //
@@ -278,14 +241,18 @@ fn syscall_stack_top() -> u64 {
 ///   - 6  `timer_arm_oneshot(t, ticks, n, bits)` -> LAPIC oneshot que
 ///     sinaliza Notification n com bits apos ticks (cap Timer+Notif WRITE)
 extern "sysv64" fn syscall_dispatch(ctx: *mut UserContext) {
-    // SAFETY: `ctx` aponta para UserContext na SYSCALL_STACK,
-    // construido pelo trampolim. Single-core; nao ha alias.
-    let ctx_ref = unsafe { &mut *ctx };
-    let num = ctx_ref.rax;
+    // H-3: NAO mantemos um `&mut UserContext` vivo atravessando as chamadas
+    // de PCT, que tambem escrevem `*ctx` pelo ponteiro cru — isso aliasaria
+    // `&mut` + ponteiro cru (fragil sob Stacked Borrows). Em vez disso lemos
+    // os campos por copia (derefs curtos) e escrevemos `rax` pelo ponteiro
+    // cru. SAFETY (todos os blocos abaixo): `ctx` aponta para um UserContext
+    // valido na SYSCALL_STACK montado por `syscall_entry`; kernel single-core
+    // sem preempcao, sem alias concorrente.
+    let num = unsafe { (*ctx).rax };
     match num {
         0 => {
             log::write_str("[kernel] ring 3 -> kernel via INT 0x80 (nop_test)\n");
-            ctx_ref.rax = 0;
+            unsafe { (*ctx).rax = 0 };
         }
         1 => {
             // [bare metal] pipeline completo: ring 3 -> kernel -> halt.
@@ -296,41 +263,39 @@ extern "sysv64" fn syscall_dispatch(ctx: *mut UserContext) {
         }
         2 => {
             // domain_call(target_dh) — target em RDI.
-            let target = ctx_ref.rdi as u8;
-            // SAFETY: ctx valido por contrato deste dispatcher.
+            let target = unsafe { (*ctx).rdi } as u8;
+            // SAFETY: ver topo; em erro, pct_call nao escreveu *ctx.
             if let Err(e) = unsafe { domain::pct_call(ctx, target) } {
                 log::write_str("[kernel] pct_call err\n");
                 let _ = e;
-                ctx_ref.rax = u64::MAX;
+                unsafe { (*ctx).rax = u64::MAX };
             }
             // Caso Ok, ctx ja foi sobrescrito para o target.
         }
         3 => {
             // domain_reply(value) — value em RDI.
-            let value = ctx_ref.rdi;
+            let value = unsafe { (*ctx).rdi };
             // SAFETY: idem.
             if let Err(e) = unsafe { domain::pct_reply(ctx, value) } {
                 log::write_str("[kernel] pct_reply err\n");
                 let _ = e;
-                ctx_ref.rax = u64::MAX;
+                unsafe { (*ctx).rax = u64::MAX };
             }
         }
         4 => {
             // notify(slot, bits) — slot em RDI (u16), bits em RSI.
-            let slot = ctx_ref.rdi as u16;
-            let bits = ctx_ref.rsi;
-            match domain::notify(slot, bits) {
-                Ok(()) => ctx_ref.rax = 0,
-                Err(_) => ctx_ref.rax = u64::MAX,
-            }
+            let (slot, bits) = unsafe { ((*ctx).rdi as u16, (*ctx).rsi) };
+            let rax = match domain::notify(slot, bits) {
+                Ok(()) => 0,
+                Err(_) => u64::MAX,
+            };
+            unsafe { (*ctx).rax = rax };
         }
         5 => {
             // poll_notify(slot) — slot em RDI. Retorna signalword em RAX.
-            let slot = ctx_ref.rdi as u16;
-            match domain::poll_notify(slot) {
-                Ok(v) => ctx_ref.rax = v,
-                Err(_) => ctx_ref.rax = u64::MAX,
-            }
+            let slot = unsafe { (*ctx).rdi } as u16;
+            let rax = domain::poll_notify(slot).unwrap_or(u64::MAX);
+            unsafe { (*ctx).rax = rax };
         }
         6 => {
             // timer_arm_oneshot(timer_slot, ticks, notif_slot, bits)
@@ -338,14 +303,17 @@ extern "sysv64" fn syscall_dispatch(ctx: *mut UserContext) {
             //   RDX = notif_slot (u16 low), R10 = bits (u64).
             // Uso R10 para o 4o argumento; RCX e volatil mas usado
             // pelo syscall entry no Linux (nao aqui), entao R10 e KISS.
-            let timer_slot = ctx_ref.rdi as u16;
-            let ticks = ctx_ref.rsi as u32;
-            let notif_slot = ctx_ref.rdx as u16;
-            let bits = ctx_ref.r10;
-            match domain::arm_timer(timer_slot, ticks, notif_slot, bits) {
-                Ok(()) => ctx_ref.rax = 0,
-                Err(_) => ctx_ref.rax = u64::MAX,
-            }
+            //
+            // A-2: arma o LAPIC, mas o IRQ NAO e entregue hoje — `IF`
+            // permanece 0 (ring 3 entra com RFLAGS=0x002). O mecanismo fica
+            // inerte ate um escalonador habilitar `IF` (ROADMAP Fase 12).
+            let (timer_slot, ticks, notif_slot, bits) =
+                unsafe { ((*ctx).rdi as u16, (*ctx).rsi as u32, (*ctx).rdx as u16, (*ctx).r10) };
+            let rax = match domain::arm_timer(timer_slot, ticks, notif_slot, bits) {
+                Ok(()) => 0,
+                Err(_) => u64::MAX,
+            };
+            unsafe { (*ctx).rax = rax };
         }
         _ => {
             // Syscall desconhecido: kernel REJEITA via erro de retorno.
@@ -354,7 +322,7 @@ extern "sysv64" fn syscall_dispatch(ctx: *mut UserContext) {
             // de syscall_dispatch). Retornar erro e mecanismo (expose information);
             // decidir o que fazer com o erro e politica do LibOS.
             log::write_str("[kernel] unknown syscall; rejecting\n");
-            ctx_ref.rax = u64::MAX;
+            unsafe { (*ctx).rax = u64::MAX };
         }
     }
 }
