@@ -5,8 +5,8 @@
 //!
 //! # Modelo
 //!
-//! Trabalhamos apenas em nivel logico: cada `PageTable` e um `[u64; 512]`
-//! representando 4 KiB de memoria fisica. A escrita real das entradas e
+//! Trabalhamos apenas em nivel logico: cada tabela de paginas e um
+//! `[u64; 512]` representando 4 KiB de memoria fisica. A escrita real e
 //! feita em frames alocados pelo `mm::frame`. Todos os mapeamentos sao de
 //! 4 KiB (sem 2 MiB / 1 GiB pages) por simplicidade: uma unica formula de
 //! walk, nenhum branching por tamanho.
@@ -26,8 +26,8 @@
 //!
 //! `#![forbid(unsafe_code)]`. A unica primitiva unsafe necessaria para
 //! paginacao (escrever em memoria fisica via ponteiro bruto) vive em
-//! `mm/mod.rs` atras de uma API safe (`PhysMem::write_u64`). Aqui
-//! manipulamos apenas valores u64 e indices dentro de `PageTable`.
+//! `mm/mod.rs` atras de ponteiros brutos. Aqui manipulamos apenas
+//! valores u64 e indices de entrada.
 
 #![forbid(unsafe_code)]
 
@@ -93,21 +93,6 @@ impl Perm {
     }
 }
 
-/// Uma tabela de paginas x86_64 (PML4/PDPT/PD/PT). 512 entradas u64.
-#[repr(C, align(4096))]
-#[derive(Clone)]
-pub struct PageTable {
-    pub entries: [u64; 512],
-}
-
-impl PageTable {
-    pub const fn zeroed() -> Self {
-        Self {
-            entries: [0u64; 512],
-        }
-    }
-}
-
 /// Indice de entrada em cada nivel dado um endereco virtual.
 #[derive(Debug, Clone, Copy)]
 pub struct Indices {
@@ -162,17 +147,9 @@ pub const fn pte_present(entry: u64) -> bool {
     entry & PTE_PRESENT != 0
 }
 
-/// Retorna `true` se um endereco virtual e canonico em x86_64 48-bit.
-/// Bits [63:48] devem replicar o bit 47 (extensao de sinal).
-pub const fn is_canonical(vaddr: u64) -> bool {
-    let high = vaddr >> 47;
-    high == 0 || high == 0x1_FFFF
-}
-
-// Usar PhysFrame/FRAME_SIZE para convencao de tamanho/alinhamento nos testes.
+// Invariantes de tamanho/alinhamento assumidas pelo walker de page tables.
 const _: () = {
     assert!(FRAME_SIZE == 4096);
-    assert!(core::mem::size_of::<PageTable>() == 4096);
     assert!(core::mem::size_of::<PhysFrame>() <= 16);
 };
 
@@ -248,17 +225,6 @@ mod tests {
         assert_eq!(i.pdpt, 510);
         assert_eq!(i.pd, 0);
         assert_eq!(i.pt, 0);
-    }
-
-    #[test]
-    fn canonical_accepts_limits() {
-        assert!(is_canonical(0x0000_0000_0000_0000));
-        assert!(is_canonical(0x0000_7FFF_FFFF_FFFF));
-        assert!(is_canonical(0xFFFF_8000_0000_0000));
-        assert!(is_canonical(0xFFFF_FFFF_FFFF_FFFF));
-        // Nao-canonicos:
-        assert!(!is_canonical(0x0000_8000_0000_0000));
-        assert!(!is_canonical(0xFFFF_7FFF_FFFF_FFFF));
     }
 
     #[test]
