@@ -67,21 +67,21 @@ at **≤ 3.5k Lines of Code**. Current footprint is:
 
 | Artifact | LoC |
 |---|---|
-| Bootloader | 1281 LoC |
-| Kernel | 3284 LoC |
-| Crates (bootinfo) | 58 LoC |
-| **Total** | **4623 LoC** - **1370 LoC (Non-essential)** = **3253 LoC** |
+| Bootloader | 1275 LoC (1192 essential) |
+| Kernel | 3251 LoC (2019 essential) |
+| Crates (bootinfo) | 58 LoC (33 essential) |
+| **Total** | **4584 LoC** - **1340 LoC (Non-essential)** = **3244 LoC** |
 
 Of this footprint, the following lines exist only as scaffolding —
 removing them yields a kernel that still boots to halt:
 
 | Non-essential | LoC |
 |---|---|
-| Host tests (cap=331, frame=124, paging=103, sha256=60, bootinfo=25, elf=23, notification=56, timer=50) | 772 |
-| Demo userland (`kernel/src/arch/x86_64/userland.rs`) | 246 |
+| Host tests (cap=345, frame=122, paging=92, sha256=60, bootinfo=25, elf=23, notification=56, timer=50) | 773 |
+| Demo userland (`kernel/src/arch/x86_64/userland.rs`) | 215 |
 | Demo functions in `kmain.rs` (demo_userland, setup_domain, fail, demo_caps, demo_physmap, log_frame_stats, demo_alloc_free) | 185 |
 | Bare-metal visual feedback (`kernel/src/fb.rs`) | 167 |
-| **Total non-essential** | **1370 (29,63% of total)** |
+| **Total non-essential** | **1340 (29,23% of total)** |
 
 Host test suite:
 **77 tests, all passing** (63 kernel + 10 bootloader + 4 bootinfo).
@@ -396,17 +396,25 @@ Make is just a thin orchestration layer. Everything below works
 without it:
 
 ```sh
-# 1. Build the bootloader (UEFI PE) and the kernel (bare-metal ELF).
-cargo build --release -p bootloader                        # workspace default target = x86_64-unknown-uefi
+# 1. Build the kernel (bare-metal ELF) FIRST — the bootloader embeds its hash.
 cargo build --release -p kernel --target x86_64-unknown-none
 
-# Or use the bundled aliases (defined in .cargo/config.toml):
-cargo build-bootloader-release
-cargo build-kernel-release
+# 2. Build the bootloader (UEFI PE). A *release* bootloader REQUIRES the kernel
+#    hash in EXOVERUM_KERNEL_SHA256, otherwise the build fails on purpose
+#    (fail-closed, AUDIT A-1): a bootloader without the embedded hash refuses
+#    to boot any kernel. `make bootloader` does this injection for you.
+EXOVERUM_KERNEL_SHA256=$(sha256sum target/x86_64-unknown-none/release/kernel | awk '{print $1}') \
+    cargo build --release -p bootloader                    # workspace default target = x86_64-unknown-uefi
 
-# 2. Run the host tests (77 tests, no QEMU needed):
+# 3. Run the host tests (77 tests, no QEMU needed; host build is not UEFI, so
+#    the hash is not required here):
 cargo test-host
 ```
+
+> **Note.** `cargo check`/`cargo clippy` (dev profile) and `cargo test-host`
+> do **not** need the env var — the A-1 build guard is gated to *release UEFI*
+> builds only. The simplest correct path remains `make`, which injects the
+> hash automatically.
 
 The two binaries land at:
 
